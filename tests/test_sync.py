@@ -46,6 +46,159 @@ def _queue(conn):
 
 
 # ─────────────────────────────────────────────────────────────
+# 0) Cihaz kimliği ve kopyalama tespiti (Görev 2)
+# ─────────────────────────────────────────────────────────────
+
+def test_fresh_install_gets_device_and_machine_id(db):
+    conn = database.get_connection()
+    did = sync.get_state(conn, "device_id")
+    mid = sync.get_state(conn, "machine_id")
+    conn.close()
+    assert did and len(did) >= 16
+    assert mid  # makine parmak izi kaydedildi
+
+
+def test_upgrade_without_machine_id_keeps_device_id(db):
+    conn = database.get_connection()
+    old_did = sync.get_state(conn, "device_id")
+    # Eski kurulumu simüle et: machine_id yok
+    conn.execute("DELETE FROM sync_state WHERE key = 'machine_id'")
+    conn.commit()
+    sync.ensure_local_sync_schema(conn)   # yükseltme yolu
+    new_did = sync.get_state(conn, "device_id")
+    mid = sync.get_state(conn, "machine_id")
+    conn.close()
+    assert new_did == old_did   # kimlik korunur
+    assert mid                  # parmak izi eklenir
+
+
+def test_db_copy_detected_new_device_id_and_reset_checkpoint(db):
+    conn = database.get_connection()
+    old_did = sync.get_state(conn, "device_id")
+    sync.set_state(conn, "last_pull_seq", "42")
+    sync.set_state(conn, "bootstrapped", "1")
+    # Başka makineye kopyalanmayı simüle et: parmak izi değişti
+    conn.execute("UPDATE sync_state SET value = 'baska-makine:dead' WHERE key = 'machine_id'")
+    conn.commit()
+    sync.ensure_local_sync_schema(conn)
+    new_did = sync.get_state(conn, "device_id")
+    cp = sync.get_state(conn, "last_pull_seq")
+    boot = sync.get_state(conn, "bootstrapped")
+    conn.close()
+    assert new_did != old_did          # yeni kimlik -> çakışma önlendi
+    assert cp == "0"                   # checkpoint sıfırlandı
+    assert boot == "0"                 # yeniden keşif tetiklenecek
+
+
+def test_checkpoint_is_per_device(tmp_path):
+    # İki ayrı yerel veritabanı -> bağımsız checkpoint.
+    old = database.DB_PATH
+    try:
+        p1 = str(tmp_path / "pc1.db")
+        database.DB_PATH = p1
+        database.init_db()
+        c1 = database.get_connection()
+        sync.set_state(c1, "last_pull_seq", "10")
+        c1.commit()
+        did1 = sync.get_state(c1, "device_id")
+        c1.close()
+
+        p2 = str(tmp_path / "pc2.db")
+        database.DB_PATH = p2
+        database.init_db()
+        c2 = database.get_connection()
+        did2 = sync.get_state(c2, "device_id")
+        cp2 = sync.get_state(c2, "last_pull_seq", "0")
+        c2.close()
+        assert did1 != did2            # farklı cihaz kimlikleri
+        assert cp2 in (None, "0")      # PC2 checkpoint'i PC1'den bağımsız
+    finally:
+        database.DB_PATH = old
+
+
+# ─────────────────────────────────────────────────────────────
+# 0b) İlk bağlantı snapshot bootstrap (Görev 2)
+# ─────────────────────────────────────────────────────────────
+
+class _FakeBootstrapRemote:
+    """bootstrap_initial_snapshot için Neon canlı tablolarını taklit eder."""
+    def __init__(self, data, max_seq=5):
+        self.data = data
+        self.max_seq = max_seq
+        self._last = ""
+
+    def execute(self, sql, params=None):
+        self._last = sql
+        return self
+
+    def fetchall(self):
+        s = self._last.lower()
+        if "from ayarlar" in s:
+            return self.data.get("ayarlar", [])
+        for tbl in sync.SYNC_ORDER:
+            if f"from {tbl} t" in s:
+                return self.data.get(tbl, [])
+        return []
+
+    def fetchone(self):
+        if "max(seq)" in self._last.lower():
+            return {"m": self.max_seq}
+        return None
+
+    def commit(self):
+        pass
+
+
+def test_bootstrap_discovers_existing_rows_and_sets_checkpoint(db):
+    data = {
+        "kurumlar": [{"uuid": "k-1", "kurum_adi": "Kurum X",
+                      "created_at": "2025-01-01", "rev": 2}],
+        "sinavlar": [{"uuid": "s-1", "sinav_adi": "Deneme", "sinav_tarihi": "2025-02-01",
+                      "kurum_id": 99, "puan": 450.0, "genel_derece": None, "il_derece": None,
+                      "ilce_derece": None, "kurum_derece": None, "sube_derece": None,
+                      "notlar": None, "created_at": "2025-02-01", "rev": 3, "__puid": "k-1"}],
+        "ayarlar": [{"key": "ai_provider", "value": "openai"},
+                    {"key": "openai_api_key", "value": "sk-SECRET"}],
+    }
+    conn = database.get_connection()
+    device_id = sync.get_device_id(conn)
+    fake = _FakeBootstrapRemote(data, max_seq=5)
+
+    n = sync.bootstrap_initial_snapshot(conn, fake, device_id)
+
+    kurum = conn.execute("SELECT id, uuid FROM kurumlar WHERE uuid='k-1'").fetchone()
+    sinav = conn.execute(
+        "SELECT s.uuid, k.uuid ku FROM sinavlar s JOIN kurumlar k ON k.id=s.kurum_id "
+        "WHERE s.uuid='s-1'").fetchone()
+    cp = sync.get_state(conn, "last_pull_seq")
+    boot = sync.get_state(conn, "bootstrapped")
+    prov = conn.execute("SELECT value FROM ayarlar WHERE key='ai_provider'").fetchone()
+    secret = conn.execute("SELECT value FROM ayarlar WHERE key='openai_api_key'").fetchone()
+    q = conn.execute("SELECT COUNT(*) n FROM sync_queue").fetchone()["n"]
+    conn.close()
+
+    assert n >= 2                      # kurum + sinav alındı
+    assert kurum is not None
+    assert sinav is not None and sinav["ku"] == "k-1"   # FK doğru çözüldü
+    assert cp == "5"                   # checkpoint günlük sonuna taşındı
+    assert boot == "1"
+    assert prov["value"] == "openai"   # ortak ayar alındı
+    assert secret is None              # hassas ayar ALINMADI
+    assert q == 0                      # bootstrap yeni outbox olayı üretmedi
+
+
+def test_bootstrap_runs_once(db):
+    conn = database.get_connection()
+    device_id = sync.get_device_id(conn)
+    fake = _FakeBootstrapRemote({}, max_seq=7)
+    sync.bootstrap_initial_snapshot(conn, fake, device_id)
+    # İkinci çağrı: zaten bootstrapped -> hiçbir şey yapmaz
+    n2 = sync.bootstrap_initial_snapshot(conn, fake, device_id)
+    conn.close()
+    assert n2 == 0
+
+
+# ─────────────────────────────────────────────────────────────
 # 1) Outbox: her tabloda ekleme/güncelleme/silme olay üretir
 # ─────────────────────────────────────────────────────────────
 

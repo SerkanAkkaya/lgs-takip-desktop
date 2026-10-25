@@ -19,6 +19,7 @@ Kimlik:
 """
 
 import os
+import socket
 import threading
 import uuid as _uuid
 from datetime import datetime
@@ -150,11 +151,8 @@ def ensure_local_sync_schema(conn):
         )
     """)
 
-    # Cihaz kimliği (bir kez üretilir, sabit kalır).
-    row = cur.execute("SELECT value FROM sync_state WHERE key = 'device_id'").fetchone()
-    if not row:
-        did = _uuid.uuid4().hex
-        cur.execute("INSERT INTO sync_state (key, value) VALUES ('device_id', ?)", (did,))
+    # Cihaz kimliği (makine parmak izi ile; kopyalama çakışması tespit edilir).
+    _ensure_device_identity(cur)
 
     # Kullanıcı verisi tablolarına uuid + base_rev kolonlarını ekle ve geriye doldur.
     for tbl in SYNC_ORDER:
@@ -255,6 +253,51 @@ def set_state(conn, key, value):
 
 def get_device_id(conn):
     return get_state(conn, "device_id")
+
+
+def _machine_fingerprint():
+    """Makineye özgü kararlı parmak izi (hostname + MAC tabanlı düğüm)."""
+    try:
+        node = _uuid.getnode()
+    except Exception:
+        node = 0
+    return f"{socket.gethostname()}:{node:x}"
+
+
+def _put_state(cur, key, value):
+    cur.execute(
+        "INSERT INTO sync_state (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+
+
+def _ensure_device_identity(cur):
+    """Benzersiz, kalıcı device_id garanti et ve veritabanı kopyalamasını tespit et.
+
+    - Yeni kurulum: rastgele device_id + güncel makine parmak izi.
+    - Mevcut kurulum güncellemesi (machine_id yoksa): kimlik korunur, parmak izi eklenir.
+    - Veritabanı başka makineye KOPYALANMIŞSA (parmak izi değişmiş): yeni device_id üretilir
+      ve checkpoint sıfırlanır -> kopya, orijinal cihazın kimliğini/ilerlemesini bozmaz.
+    """
+    did = cur.execute("SELECT value FROM sync_state WHERE key = 'device_id'").fetchone()
+    mid = cur.execute("SELECT value FROM sync_state WHERE key = 'machine_id'").fetchone()
+    fp = _machine_fingerprint()
+
+    if not did:
+        _put_state(cur, "device_id", _uuid.uuid4().hex)
+        _put_state(cur, "machine_id", fp)
+        return
+    if not mid:
+        # Eski kurulumun yükseltilmesi: kimliği koru, parmak izini kaydet.
+        _put_state(cur, "machine_id", fp)
+        return
+    if mid["value"] != fp:
+        # Veritabanı kopyalanmış -> yeni kimlik + yeniden keşif (bootstrap).
+        _put_state(cur, "device_id", _uuid.uuid4().hex)
+        _put_state(cur, "machine_id", fp)
+        _put_state(cur, "last_pull_seq", "0")
+        _put_state(cur, "bootstrapped", "0")
 
 
 def pending_count(conn):
@@ -370,6 +413,29 @@ def ensure_remote_sync_schema(remote):
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_sync_changes_seq ON sync_changes(seq)")
+
+    # Merkezi cihaz kaydı: her .exe kurulumu benzersiz device_id ile kendini kaydeder.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sync_devices (
+            device_id TEXT PRIMARY KEY,
+            machine_label TEXT,
+            last_seq BIGINT NOT NULL DEFAULT 0,
+            first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_seen TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+    remote.commit()
+
+
+def _register_device(remote, device_id, machine_label, last_seq):
+    """Cihazı Neon'daki merkezi kayıt tablosunda güncelle (gözlemlenebilirlik için)."""
+    remote.execute(
+        "INSERT INTO sync_devices (device_id, machine_label, last_seq, first_seen, last_seen) "
+        "VALUES (%s, %s, %s, now(), now()) "
+        "ON CONFLICT (device_id) DO UPDATE SET "
+        "machine_label = EXCLUDED.machine_label, last_seq = EXCLUDED.last_seq, last_seen = now()",
+        (device_id, machine_label, last_seq),
+    )
     remote.commit()
 
 
@@ -615,6 +681,87 @@ def _apply_change_local(local, change):
     return True
 
 
+def _neon_row_to_change(tbl, r, cfg):
+    """Neon canlı tablo satırını, _apply_change_local'ın beklediği change sözlüğüne çevir."""
+    payload = {}
+    for col in cfg["cols"]:
+        if col == cfg["fk"]:
+            continue
+        v = r[col]
+        if col in cfg["blobs"] and v is not None and isinstance(v, (bytes, bytearray, memoryview)):
+            v = bytes(v).hex()
+        payload[col] = v
+    parent_uuid = None
+    if cfg["fk"]:
+        parent_uuid = r["__puid"] if "__puid" in r.keys() else None
+        payload["__parent_uuid__"] = parent_uuid
+    return {"tbl": tbl, "op": "U", "row_uuid": r["uuid"], "parent_uuid": parent_uuid,
+            "payload": payload, "rev": (r["rev"] if "rev" in r.keys() else 1) or 1,
+            "device_id": "__bootstrap__"}
+
+
+def bootstrap_initial_snapshot(local, remote, device_id):
+    """İlk bağlantıda Neon'un MEVCUT tüm kayıtlarını keşfet ve yerele al.
+
+    Kritik: pull() yalnızca sync_changes günlüğünü okur; günlükten önce var olan
+    (migrate edilmiş) kayıtlar orada YOKTUR. Bu fonksiyon canlı tabloların tamamını
+    okuyarak yeni cihazın mevcut kayıtları atlamamasını garanti eder; ardından
+    checkpoint'i günlüğün mevcut sonuna taşıyıp artımlı senkronizasyona geçer.
+    """
+    if (get_state(local, "bootstrapped", "0") or "0") == "1":
+        return 0
+
+    applied = 0
+    _set_applying(local, True)
+    try:
+        for tbl in SYNC_ORDER:
+            cfg = TABLE_CONFIG[tbl]
+            if cfg["fk"]:
+                q = (f"SELECT t.*, p.uuid AS __puid FROM {tbl} t "
+                     f"LEFT JOIN {cfg['parent']} p ON t.{cfg['fk']} = p.id "
+                     f"WHERE COALESCE(t.deleted, 0) = 0")
+            else:
+                q = f"SELECT t.* FROM {tbl} t WHERE COALESCE(t.deleted, 0) = 0"
+            rows = remote.execute(q).fetchall()
+            deferred = []
+            for r in rows:
+                if not r["uuid"]:
+                    continue
+                if _apply_change_local(local, _neon_row_to_change(tbl, r, cfg)):
+                    applied += 1
+                else:
+                    deferred.append(r)
+            progress = True
+            while deferred and progress:
+                progress = False
+                still = []
+                for r in deferred:
+                    if _apply_change_local(local, _neon_row_to_change(tbl, r, cfg)):
+                        applied += 1
+                        progress = True
+                    else:
+                        still.append(r)
+                deferred = still
+
+        # Ortak (hassas olmayan) ayarları da al.
+        for r in remote.execute("SELECT key, value FROM ayarlar").fetchall():
+            if _is_sensitive_setting(r["key"]):
+                continue
+            local.execute(
+                "INSERT INTO ayarlar (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (r["key"], r["value"]))
+
+        # Checkpoint'i günlüğün mevcut sonuna taşı -> bundan sonrası artımlı.
+        mx = remote.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM sync_changes").fetchone()["m"]
+        set_state(local, "last_pull_seq", str(mx))
+        set_state(local, "bootstrapped", "1")
+    finally:
+        _set_applying(local, False)
+    local.commit()
+    return applied
+
+
 def pull(local, remote, device_id):
     """Neon'daki (başka cihazlara ait) değişiklikleri yerel SQLite'a uygula."""
     cp = int(get_state(local, "last_pull_seq", "0") or 0)
@@ -713,13 +860,20 @@ def sync_now():
 
         ensure_remote_sync_schema(remote)
         pushed = push(local, remote, device_id)
+        # Yeni cihaz: mevcut Neon kayıtlarını keşfet (günlükte olmayanlar dahil), sonra artımlı.
+        bootstrapped = bootstrap_initial_snapshot(local, remote, device_id)
         pulled = pull(local, remote, device_id)
+        try:
+            _register_device(remote, device_id, get_state(local, "machine_id", ""),
+                             int(get_state(local, "last_pull_seq", "0") or 0))
+        except Exception:
+            pass  # cihaz kaydı gözlemseldir; senkronizasyonu bloke etmez
 
         conflicts = local.execute("SELECT COUNT(*) AS n FROM sync_conflicts").fetchone()["n"]
         set_state(local, "last_sync_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         set_state(local, "last_status", "ok")
         local.commit()
-        return SyncResult(ok=True, pushed=pushed, pulled=pulled,
+        return SyncResult(ok=True, pushed=pushed, pulled=bootstrapped + pulled,
                           pending_before=pending_before, conflicts=conflicts)
     except Exception as exc:
         try:
