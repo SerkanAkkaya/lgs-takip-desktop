@@ -7,11 +7,9 @@ import os
 import sys
 import json
 import re
+import sqlite3
 from pathlib import Path
 from datetime import datetime, date, timedelta
-
-import psycopg
-from psycopg.rows import dict_row
 
 # ─── Veritabanı Sürüm Yönetimi ───
 # Her şema değişikliğinde DB_VERSION artırılır ve _migrations'a yeni fonksiyon eklenir.
@@ -64,58 +62,9 @@ def _get_database_url():
 
 
 class _Cursor:
-    """Compatibility layer for the existing SQLite-style query code."""
-    _ID_TABLES = {
-        "soru_takip", "kurumlar", "sinavlar", "sinav_dersleri", "karneler",
-        "karne_ders_analizi", "karne_konu_analizi", "rag_chunks",
-    }
+    """Kept for backwards import compatibility; no longer used at runtime."""
+    pass
 
-    def __init__(self, cursor):
-        self._cursor = cursor
-        self._lastrowid = None
-
-    @property
-    def lastrowid(self):
-        return self._lastrowid
-
-    def execute(self, query, params=None):
-        query = re.sub(
-            r"date\('now',\s*'-'\s*\|\|\s*\?\s*\|\|\s*' days',\s*'localtime'\)",
-            "to_char(CURRENT_DATE - ?, 'YYYY-MM-DD')", query, flags=re.IGNORECASE)
-        query = query.replace("INSERT OR REPLACE INTO", "INSERT INTO")
-        query = query.replace("datetime('now', 'localtime')", "CURRENT_TIMESTAMP")
-        conflict = None
-        if re.search(r"INSERT INTO\s+(db_meta|ayarlar)\b", query, re.IGNORECASE):
-            conflict = " ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
-        query = re.sub(r"\?", "%s", query)
-        if conflict:
-            query = query.rstrip().rstrip(";") + conflict
-
-        insert_match = re.match(r"\s*INSERT\s+INTO\s+(\w+)", query, re.IGNORECASE)
-        returns_id = bool(insert_match and insert_match.group(1).lower() in self._ID_TABLES
-                          and not re.search(r"\bRETURNING\b", query, re.IGNORECASE))
-        if returns_id:
-            query = query.rstrip().rstrip(";") + " RETURNING id"
-        self._lastrowid = None
-        self._cursor.execute(query, params)
-        if returns_id:
-            row = self._cursor.fetchone()
-            self._lastrowid = row["id"] if row else None
-        return self
-
-    def __getattr__(self, name):
-        return getattr(self._cursor, name)
-
-
-class _Connection:
-    def __init__(self, connection):
-        self._connection = connection
-
-    def cursor(self):
-        return _Cursor(self._connection.cursor())
-
-    def __getattr__(self, name):
-        return getattr(self._connection, name)
 
 DERSLER = ["Türkçe", "Matematik", "Fen", "Sosyal", "İngilizce", "Din"]
 
@@ -139,9 +88,19 @@ DERS_RENKLERI = {
 }
 
 
+def _dict_row_factory(cursor, row):
+    """Return each SQLite row as a plain dict so existing dict(row)/row[key] code works."""
+    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+
+
 def get_connection():
-    """Veritabanı bağlantısı oluştur."""
-    return _Connection(psycopg.connect(_get_database_url(), row_factory=dict_row, connect_timeout=15))
+    """Yerel SQLite veritabanı bağlantısı oluştur (yerel-öncelikli kullanım)."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = _dict_row_factory
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA recursive_triggers = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
 
 
 def init_db():
@@ -165,14 +124,14 @@ def init_db():
     # İlk kurulum: tabloları oluştur
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS soru_takip (
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             tarih TEXT NOT NULL,
             ders TEXT NOT NULL,
             soru_sayisi INTEGER NOT NULL DEFAULT 0,
             dogru INTEGER NOT NULL DEFAULT 0,
             yanlis INTEGER NOT NULL DEFAULT 0,
             net REAL NOT NULL DEFAULT 0.0,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::TEXT)
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         )
     """)
     cursor.execute("""
@@ -185,18 +144,18 @@ def init_db():
     # ── Sınav Takip Tabloları ──
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS kurumlar (
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             kurum_adi TEXT NOT NULL UNIQUE,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::TEXT)
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sinavlar (
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             sinav_adi TEXT NOT NULL,
             sinav_tarihi TEXT NOT NULL,
-            kurum_id BIGINT,
+            kurum_id INTEGER,
             puan REAL,
             genel_derece INTEGER,
             il_derece INTEGER,
@@ -204,15 +163,15 @@ def init_db():
             kurum_derece INTEGER,
             sube_derece INTEGER,
             notlar TEXT,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::TEXT),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             FOREIGN KEY (kurum_id) REFERENCES kurumlar(id)
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sinav_dersleri (
-            id BIGSERIAL PRIMARY KEY,
-            sinav_id BIGINT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sinav_id INTEGER NOT NULL,
             ders TEXT NOT NULL,
             soru_sayisi INTEGER NOT NULL DEFAULT 0,
             dogru INTEGER NOT NULL DEFAULT 0,
@@ -233,21 +192,21 @@ def init_db():
     # ── Karne (PDF) Takip Tabloları ──
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS karneler (
-            id BIGSERIAL PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             dosya_adi TEXT NOT NULL,
             sinav_tarihi TEXT NOT NULL,
             kurum_adi TEXT,
             sinav_adi TEXT,
             raw_text TEXT,
             ai_ozet TEXT,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::TEXT)
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS karne_ders_analizi (
-            id BIGSERIAL PRIMARY KEY,
-            karne_id BIGINT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            karne_id INTEGER NOT NULL,
             ders TEXT NOT NULL,
             soru_sayisi INTEGER DEFAULT 0,
             dogru INTEGER DEFAULT 0,
@@ -261,8 +220,8 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS karne_konu_analizi (
-            id BIGSERIAL PRIMARY KEY,
-            karne_id BIGINT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            karne_id INTEGER NOT NULL,
             ders TEXT NOT NULL,
             konu TEXT NOT NULL,
             kazanim TEXT,
@@ -284,13 +243,13 @@ def init_db():
     # ── RAG (Bilgi Bankası) Tablosu ──
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS rag_chunks (
-            id BIGSERIAL PRIMARY KEY,
-            karne_id BIGINT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            karne_id INTEGER NOT NULL,
             chunk_text TEXT NOT NULL,
-            embedding BYTEA,
+            embedding BLOB,
             provider TEXT NOT NULL,
             chunk_index INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::TEXT),
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
             FOREIGN KEY (karne_id) REFERENCES karneler(id) ON DELETE CASCADE
         )
     """)
@@ -303,6 +262,10 @@ def init_db():
 
     # ── Migration'ları çalıştır ──
     _run_migrations(cursor, current_version)
+
+    # ── Senkronizasyon şeması (uuid kolonları, outbox, trigger'lar) ──
+    import sync
+    sync.ensure_local_sync_schema(conn)
 
     # Sürümü güncelle
     cursor.execute("""
@@ -346,16 +309,8 @@ def _run_migrations(cursor, current_version):
 
 
 def _migrate_v5(cursor):
-    for table in ("soru_takip", "kurumlar", "sinavlar", "karneler", "rag_chunks"):
-        cursor.execute(
-            f"ALTER TABLE {table} ALTER COLUMN created_at DROP DEFAULT"
-        )
-        cursor.execute(
-            f"ALTER TABLE {table} ALTER COLUMN created_at TYPE TEXT USING created_at::text"
-        )
-        cursor.execute(
-            f"ALTER TABLE {table} ALTER COLUMN created_at SET DEFAULT (CURRENT_TIMESTAMP::TEXT)"
-        )
+    # Yerel SQLite'ta created_at zaten TEXT; Postgres'e özel ALTER adımları gerekmez.
+    return None
 
 
 # ═══════════════════════════════════════════════════════════
@@ -645,7 +600,7 @@ def aylik_ozet(yil=None):
     conn = get_connection()
     cursor = conn.cursor()
     query = """
-        SELECT to_char(tarih::date, 'YYYY-MM') as ay,
+        SELECT strftime('%Y-%m', tarih) as ay,
                ders,
                SUM(soru_sayisi) as toplam_soru,
                SUM(dogru) as toplam_dogru,
@@ -656,7 +611,7 @@ def aylik_ozet(yil=None):
     """
     params = []
     if yil:
-        query += " AND to_char(tarih::date, 'YYYY') = ?"
+        query += " AND strftime('%Y', tarih) = ?"
         params.append(str(yil))
 
     query += " GROUP BY ay, ders ORDER BY ay, ders"
@@ -833,7 +788,7 @@ def kurum_ekle(kurum_adi: str) -> int:
         cursor.execute("INSERT INTO kurumlar (kurum_adi) VALUES (?)", (kurum_adi.strip(),))
         conn.commit()
         last_id = cursor.lastrowid
-    except psycopg.IntegrityError:
+    except sqlite3.IntegrityError:
         last_id = -1  # Zaten var
     conn.close()
     return last_id

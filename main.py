@@ -6,6 +6,7 @@ Desktop uygulaması - Soru çözüm takibi ve analiz
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
+import sys
 import ttkbootstrap as ttkb
 from ttkbootstrap.constants import *
 from ttkbootstrap.dialogs import Messagebox
@@ -39,6 +40,7 @@ plt.rcParams["font.family"] = ["Segoe UI", "Arial", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
 import database as db
+import sync
 
 # Sabitler
 DERSLER = db.DERSLER
@@ -75,6 +77,9 @@ class LGSTakipApp:
         self._build_menu()
 
         self._build_ui()
+
+        # Açılışta otomatik senkronizasyon (arka plan thread'inde, UI'ı bloke etmez)
+        self.root.after(500, self._baslangic_senkronizasyonu)
 
     def _build_menu(self):
         """Menü çubuğunu oluştur."""
@@ -269,6 +274,15 @@ class LGSTakipApp:
         right_frame = ttkb.Frame(header_frame)
         right_frame.pack(side=RIGHT)
 
+        # Senkronizasyon butonu (ana pencerede, her zaman görünür)
+        self.sync_button = ttkb.Button(
+            right_frame,
+            text="🔄 Sync Remote",
+            command=self._sync_remote_clicked,
+            bootstyle="success",
+        )
+        self.sync_button.pack(side=RIGHT, padx=(3, 10))
+
         ttkb.Button(
             right_frame,
             text="📥 İçe Aktar",
@@ -290,15 +304,23 @@ class LGSTakipApp:
             bootstyle="secondary",
         ).pack(side=RIGHT, padx=(0, 10))
 
-        # DB konum bilgisi (küçük yazı)
+        # DB konum bilgisi + senkronizasyon durumu (küçük yazı)
         db_info_frame = ttkb.Frame(self.root)
         db_info_frame.pack(fill=X, padx=12)
         ttkb.Label(
             db_info_frame,
-            text="?? Veritaban?: Neon (?evrimi?i)",
+            text="💾 Veritabanı: Yerel SQLite (çevrimdışı çalışır) • ☁️ Neon ile senkronize",
             font=("Segoe UI", 8),
             bootstyle="secondary",
         ).pack(side=LEFT)
+        self.sync_status_label = ttkb.Label(
+            db_info_frame,
+            text="",
+            font=("Segoe UI", 8),
+            bootstyle="secondary",
+        )
+        self.sync_status_label.pack(side=RIGHT)
+        self._sync_status_guncelle()
 
         # Notebook (Tab kontrolü)
         self.notebook = ttkb.Notebook(self.root, bootstyle="primary")
@@ -312,6 +334,128 @@ class LGSTakipApp:
         self._build_sinav_tab()
         self._build_ai_tab()
         self._build_karne_tab()
+
+    # =====================================================
+    # SENKRONİZASYON (Sync Remote + açılış popup'ı)
+    # =====================================================
+    def _sync_status_guncelle(self):
+        """Header'daki senkronizasyon durum etiketini güncelle."""
+        try:
+            st = sync.get_sync_status()
+        except Exception:
+            return
+        last = st.get("last_sync_at") or "henüz yok"
+        pend = st.get("pending", 0)
+        txt = f"Son senkron: {last}  •  Bekleyen: {pend}"
+        if st.get("conflicts"):
+            txt += f"  •  Çakışma: {st['conflicts']}"
+        try:
+            self.sync_status_label.configure(text=txt)
+        except Exception:
+            pass
+
+    def _sync_calistir_thread(self, on_done):
+        """sync_now()'ı arka plan thread'inde çalıştır; sonucu ana thread'e taşı."""
+        def worker():
+            result = sync.sync_now()
+            try:
+                self.root.after(0, lambda: on_done(result))
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _sync_remote_clicked(self):
+        """Sync Remote butonu: elle çift yönlü senkronizasyon."""
+        if sync.is_running():
+            messagebox.showinfo("Senkronizasyon", "Zaten bir senkronizasyon çalışıyor.")
+            return
+        self.sync_button.configure(text="⏳ Syncing...", state="disabled")
+
+        def done(result):
+            self.sync_button.configure(text="🔄 Sync Remote", state="normal")
+            self._sync_status_guncelle()
+            if result.skipped:
+                return
+            if result.offline:
+                messagebox.showwarning("Senkronizasyon", result.summary())
+            elif result.ok:
+                messagebox.showinfo("Senkronizasyon", result.summary())
+            else:
+                messagebox.showerror("Senkronizasyon", result.summary())
+
+        self._sync_calistir_thread(done)
+
+    def _popup_kapat_butonlari(self, parent, popup, retry=False):
+        for w in parent.winfo_children():
+            w.destroy()
+        if retry:
+            ttkb.Button(
+                parent, text="🔄 Tekrar Dene", bootstyle="success",
+                command=lambda: (popup.destroy(), self._sync_remote_clicked()),
+            ).pack(side=LEFT, padx=5)
+        ttkb.Button(parent, text="Kapat", bootstyle="secondary",
+                    command=popup.destroy).pack(side=LEFT, padx=5)
+
+    def _baslangic_senkronizasyonu(self):
+        """Açılışta otomatik senkronizasyon + görünür durum popup'ı."""
+        popup = tk.Toplevel(self.root)
+        popup.title("Senkronizasyon")
+        popup.resizable(False, False)
+        popup.transient(self.root)
+
+        w, h = 470, 210
+        popup.geometry(f"{w}x{h}")
+        popup.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 3
+        popup.geometry(f"+{x}+{y}")
+
+        frame = ttkb.Frame(popup, padding=20)
+        frame.pack(fill=BOTH, expand=True)
+
+        ttkb.Label(frame, text="🔄 Senkronizasyon",
+                   font=("Segoe UI", 13, "bold"), bootstyle="primary").pack(anchor=W)
+        msg = ttkb.Label(
+            frame,
+            text="Uzak veritabanı ile senkronizasyon yapılıyor. Lütfen bekleyin...",
+            font=("Segoe UI", 10), wraplength=430, justify=LEFT,
+        )
+        msg.pack(anchor=W, pady=(10, 8))
+
+        pb = ttkb.Progressbar(frame, mode="indeterminate", bootstyle="info")
+        pb.pack(fill=X, pady=(0, 10))
+        pb.start(12)
+
+        btnframe = ttkb.Frame(frame)
+        btnframe.pack(fill=X, pady=(4, 0))
+
+        self.sync_button.configure(text="⏳ Syncing...", state="disabled")
+
+        def done(result):
+            try:
+                pb.stop()
+            except Exception:
+                pass
+            self.sync_button.configure(text="🔄 Sync Remote", state="normal")
+            self._sync_status_guncelle()
+
+            if result.skipped:
+                msg.configure(text=result.summary())
+                popup.after(1500, popup.destroy)
+                return
+            if result.ok:
+                msg.configure(text=result.summary())
+                popup.after(2000, popup.destroy)
+                return
+            if result.offline:
+                msg.configure(
+                    text=result.summary() +
+                    "\n\nYerel kayıt işlemleriniz normal şekilde çalışmaya devam ediyor.")
+            else:
+                msg.configure(text=result.summary())
+            self._popup_kapat_butonlari(btnframe, popup, retry=True)
+
+        self._sync_calistir_thread(done)
 
     # =====================================================
     # SEKME 1: VERİ GİRİŞİ
@@ -4614,8 +4758,8 @@ if __name__ == "__main__":
         app.run()
     except Exception as exc:
         messagebox.showerror(
-            "Veritabanı bağlantısı kurulamadı",
-            "Neon veritabanına bağlanılamadı. İnternet bağlantısını ve EXE yanındaki "
-            ".env.local dosyasındaki DATABASE_URL değerini kontrol edin.\n\n"
+            "Uygulama başlatılamadı",
+            "Yerel veritabanı hazırlanırken bir hata oluştu. EXE yanındaki "
+            "lgs_takip.db dosyasına yazma izni olduğundan emin olun.\n\n"
             f"Hata: {type(exc).__name__}: {exc}",
         )
