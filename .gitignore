@@ -5,3 +5,7 @@ node_modules/
 build/
 dist/
 /.agents
+__pycache__/
+__pycache__/main.cpython-314.pyc
+__pycache__/sync.cpython-314.pyc
+PDFS/

@@ -55,6 +55,9 @@ AY_ISIMLERI = {
 APP_VERSION = "1.1.0"
 APP_DEVELOPER = "Serkan Akkaya"
 
+# Hızlı ve güncel varsayılan Gemini modeli (thinking ağırlıklı alias'lar masaüstünde yavaş kalıyor).
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
 
 class LGSTakipApp:
     def __init__(self):
@@ -166,7 +169,7 @@ class LGSTakipApp:
         def on_provider_change():
             p = provider_var.get()
             if p == "gemini":
-                info_label.configure(text="Ücretsiz API anahtarı: aistudio.google.com\nModel: gemini-2.0-flash (Hızlı, ücretsiz kotayla)")
+                info_label.configure(text="Ücretsiz API anahtarı: aistudio.google.com\nModel: gemini-2.5-flash (Hızlı, ücretsiz kotayla)")
                 key_var.set(db.oku_ayar("gemini_api_key", ""))
             else:
                 info_label.configure(text="API anahtarı: platform.openai.com → API Keys\nModel: gpt-4o-mini (Çok ucuz ~$0.003/analiz)")
@@ -2160,14 +2163,17 @@ class LGSTakipApp:
             sinav_filter, textvariable=self.sinav_liste_kurum_var,
             state="readonly", font=("Segoe UI", 9), width=15)
         self.sinav_liste_kurum_combo.pack(side=LEFT, padx=2)
+        # Kurum seçimi değiştiğinde tabloyu beklemeden otomatik filtrele.
+        self.sinav_liste_kurum_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._sinav_listesini_guncelle()
+        )
 
-        ttkb.Button(sinav_filter, text="🔍", command=self._sinav_listesini_guncelle,
-            bootstyle="primary-outline", width=3).pack(side=LEFT, padx=2)
-
-        ttkb.Button(sinav_filter, text="🗑️ Sil", command=self._sinav_sil,
-            bootstyle="danger-outline", width=6).pack(side=RIGHT, padx=2)
-        ttkb.Button(sinav_filter, text="✏️ Düzenle", command=self._sinav_duzenle,
-            bootstyle="warning-outline", width=8).pack(side=RIGHT, padx=2)
+        # Eylem butonları: emojisiz ve yeterli genişlikte, yazılar düzgün görünsün.
+        ttkb.Button(sinav_filter, text="Sil", command=self._sinav_sil,
+            bootstyle="danger-outline", width=7).pack(side=RIGHT, padx=2)
+        ttkb.Button(sinav_filter, text="Düzenle", command=self._sinav_duzenle,
+            bootstyle="warning-outline", width=9).pack(side=RIGHT, padx=2)
 
         # Tablo
         cols = ("id", "tarih", "sinav", "kurum", "puan", "genel", "toplam_net")
@@ -2179,9 +2185,21 @@ class LGSTakipApp:
             "kurum": ("Kurum", 90), "puan": ("Puan", 65),
             "genel": ("Genel", 55), "toplam_net": ("T.Net", 55)
         }
+        # Sütun başlıklarına tıklayarak sıralama yapılabilir.
+        self._sinav_siralama_durum = {}
         for col, (h, w) in headers_w.items():
-            self.sinav_tablo.heading(col, text=h)
+            self.sinav_tablo.heading(
+                col, text=h,
+                command=lambda c=col: self._sinav_tablo_sirala(c)
+            )
             self.sinav_tablo.column(col, width=w, anchor=CENTER if col != "sinav" else W)
+
+        # Filtreye göre listelenen sınav sayısı.
+        self.sinav_sayisi_label = ttkb.Label(
+            sag_frame, text="Toplam sınav: 0",
+            font=("Segoe UI", 9, "bold"), bootstyle="primary"
+        )
+        self.sinav_sayisi_label.pack(side=BOTTOM, anchor=E, fill=X, pady=(6, 0))
 
         sinav_scroll = ttkb.Scrollbar(sag_frame, orient=VERTICAL, command=self.sinav_tablo.yview)
         self.sinav_tablo.configure(yscrollcommand=sinav_scroll.set)
@@ -2376,6 +2394,34 @@ class LGSTakipApp:
             self.sinav_ders_vars[ders]["d"].set("0")
             self.sinav_ders_vars[ders]["y"].set("0")
 
+    def _sinav_tablo_sirala(self, sutun):
+        """Sınav tablosunu seçilen sütuna göre artan/azalan sırala."""
+        items = [(self.sinav_tablo.set(item, sutun), item)
+                 for item in self.sinav_tablo.get_children("")]
+
+        # Aynı sütuna tekrar tıklanınca sıralama yönünü tersine çevir.
+        ters = self._sinav_siralama_durum.get(sutun, False)
+
+        def anahtar(kayit):
+            deger, _item = kayit
+            if sutun == "tarih":
+                try:
+                    return datetime.strptime(deger, "%d.%m.%Y")
+                except (ValueError, TypeError):
+                    return datetime.min
+            if sutun in ("id", "puan", "genel", "toplam_net"):
+                try:
+                    return float(deger.replace(",", "."))
+                except (ValueError, AttributeError):
+                    return float("-inf")
+            return (deger or "").casefold()
+
+        items.sort(key=anahtar, reverse=ters)
+        for index, (_deger, item) in enumerate(items):
+            self.sinav_tablo.move(item, "", index)
+
+        self._sinav_siralama_durum[sutun] = not ters
+
     def _sinav_listesini_guncelle(self):
         """Sınav listesini güncelle."""
         for item in self.sinav_tablo.get_children():
@@ -2391,6 +2437,7 @@ class LGSTakipApp:
                     break
 
         sinavlar = db.sinavlari_getir(kurum_id=kurum_id)
+        self.sinav_sayisi_label.configure(text=f"Toplam sınav: {len(sinavlar)}")
 
         for s in sinavlar:
             # Toplam net hesapla
@@ -3154,13 +3201,24 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
                 )
             self.root.after(0, self._ai_sonuc_goster, hata, False)
 
+    def _gemini_model_adi(self) -> str:
+        """Kayıtlı Gemini modelini döndür; boş veya artık kullanılmayan adları günceller."""
+        model = (db.oku_ayar("ai_model", "") or "").strip()
+        if (not model
+                or model in ("gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro",
+                             "gemini-pro", "gemini-1.0-pro", "gemini-2.0-flash-exp")
+                or model.startswith("gemini-1.")
+                or model.startswith("gemini-2.0")):
+            return DEFAULT_GEMINI_MODEL
+        return model
+
     def _gemini_cagir(self, api_key: str, prompt: str) -> str:
         """Google Gemini API çağrısı."""
         import google.generativeai as genai
 
         genai.configure(api_key=api_key)
 
-        model_adi = db.oku_ayar("ai_model", "") or "gemini-2.0-flash"
+        model_adi = self._gemini_model_adi()
         model = genai.GenerativeModel(model_adi)
 
         response = model.generate_content(
@@ -3169,8 +3227,9 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
                 temperature=0.7,
                 max_output_tokens=4096,
             ),
+            request_options={"timeout": 120},
         )
-        return response.text if response.text else "AI yanıt üretemedi."
+        return self._gemini_response_to_text(response) or "AI yanıt üretemedi."
 
     def _openai_cagir(self, api_key: str, prompt: str) -> str:
         """OpenAI API çağrısı."""
@@ -3465,6 +3524,11 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         def islem():
             try:
                 sonuc = self._karne_ai_analiz(raw_text, provider, api_key)
+                # AI hiç ders/konu çıkaramadıysa boş kayıt oluşturma, kullanıcıyı bilgilendir.
+                if not sonuc.get("dersler") and not sonuc.get("konular"):
+                    self.root.after(0, lambda: self._karne_bos_sonuc(
+                        dosya_adi, raw_text, sonuc, progress_win))
+                    return
                 # RAG: chunk + embed (opsiyonel, hata durumunda atla)
                 rag_data = None
                 try:
@@ -3607,7 +3671,7 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=4096,
+                max_tokens=8192,
                 response_format={"type": "json_object"},
             )
             yanit = self._ai_response_to_text(response.choices[0].message.content)
@@ -3615,7 +3679,7 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
             import google.generativeai as genai
 
             genai.configure(api_key=api_key)
-            model_adi = db.oku_ayar("ai_model", "") or "gemini-2.0-flash"
+            model_adi = self._gemini_model_adi()
             model = genai.GenerativeModel(
                 model_adi,
                 system_instruction="Sen bir PDF karne analiz uzmanısın. Sadece geçerli JSON formatında yanıt ver. Markdown code block, açıklama veya ek metin ekleme.",
@@ -3624,13 +3688,18 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=0.1,
-                    max_output_tokens=4096,
+                    max_output_tokens=8192,
                     response_mime_type="application/json",
                 ),
+                request_options={"timeout": 120},
             )
             yanit = self._gemini_response_to_text(response)
 
-        return self._parse_karne_ai_json(yanit)
+        sonuc = self._parse_karne_ai_json(yanit)
+        # Boş analiz durumunda gerçek AI yanıtını debug için sakla.
+        # Bu alan yalnızca dahili hata ayıklama amacıyla kullanılır.
+        sonuc["_raw_ai_response"] = yanit
+        return sonuc
 
     def _ai_response_to_text(self, content) -> str:
         """SDK farkliliklarina karsi AI yanitini duz metne indirger."""
@@ -3952,6 +4021,38 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         if len(mesaj) > 800:
             mesaj = mesaj[:800] + "\n\n... (devamı debug dosyasında)"
         messagebox.showerror("AI Analiz Hatası", f"Karne analiz edilemedi:\n\n{mesaj}")
+
+    def _karne_bos_sonuc(self, dosya_adi, raw_text, sonuc, progress_win):
+        """AI karneden ders/konu çıkaramadı: bilgilendir, boş (0/0) kayıt oluşturma."""
+        try:
+            progress_win.destroy()
+        except Exception:
+            pass
+        n = len((raw_text or "").strip())
+        # PDF metni yerine AI'nın gerçek yanıtını kaydet; boş analizde sorun
+        # yanıtın içeriğinde veya beklenen alanların boş gelmesinde olabilir.
+        ai_yaniti = sonuc.get("_raw_ai_response", "")
+        hata_detay = (
+            f"BOŞ ANALİZ — {dosya_adi} | "
+            f"dersler={len(sonuc.get('dersler', []))}, "
+            f"konular={len(sonuc.get('konular', []))}, "
+            f"ozet={sonuc.get('ozet', '')!r}"
+        )
+        debug_dosya = self._debug_kaydet(ai_yaniti, hata_detay)
+        extra = ""
+        if debug_dosya:
+            extra = f"\n\n📁 AI yanıtı ve analiz durumu debug dosyasına kaydedildi:\n{os.path.basename(debug_dosya)}"
+        resim_ipucu = ""
+        if n < 200:
+            resim_ipucu = ("\n\n⚠️ Çıkarılan metin çok kısa — PDF büyük olasılıkla taranmış/resim "
+                           "tabanlı. Bu durumda metin seçilemez; metin tabanlı (seçilebilir) bir "
+                           "karne PDF'i kullanın.")
+        messagebox.showwarning(
+            "Karne Analiz Edilemedi",
+            f"AI bu karneden ders/konu bilgisi çıkaramadı (0 ders, 0 konu).\n\n"
+            f"PDF'den çıkarılan metin uzunluğu: {n} karakter.\n"
+            f"Hatalı/boş kayıt oluşturulmadı.{resim_ipucu}{extra}"
+        )
 
     def _karne_sil(self):
         """Seçili karneleri sil."""
@@ -4628,13 +4729,14 @@ Bu bilgileri kullanarak soruyu detaylı ve Türkçe olarak yanıtla.
         else:
             import google.generativeai as genai
             genai.configure(api_key=api_key)
-            model_adi = db.oku_ayar("ai_model", "") or "gemini-2.0-flash"
+            model_adi = self._gemini_model_adi()
             model = genai.GenerativeModel(model_adi)
             response = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.5, max_output_tokens=4096))
-            return response.text if response.text else "Yanıt üretilemedi."
+                    temperature=0.5, max_output_tokens=4096),
+                request_options={"timeout": 120})
+            return self._gemini_response_to_text(response) or "Yanıt üretilemedi."
 
     def _rag_sonuc_goster(self, yanit: str, kaynak_sayisi: int):
         """RAG sorgu sonucunu göster."""

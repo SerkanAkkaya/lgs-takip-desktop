@@ -494,13 +494,12 @@ def _remote_delete(remote, tbl, row_uuid, device_id):
 
 
 def _remote_setting_upsert(remote, key, value, device_id):
-    remote.execute(
+    row = remote.execute(
         "INSERT INTO ayarlar (key, value, rev, last_device) VALUES (%s, %s, 1, %s) "
         "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "
         "rev = ayarlar.rev + 1, last_device = EXCLUDED.last_device "
         "RETURNING rev", (key, value, device_id),
-    )
-    row = remote.fetchone()
+    ).fetchone()
     rev = row["rev"] if row else 1
     _remote_record_change(remote, "ayarlar", "U", "ayar:" + key, None,
                           {"key": key, "value": value}, rev, device_id)
