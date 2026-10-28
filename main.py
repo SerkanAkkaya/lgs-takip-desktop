@@ -1,4 +1,4 @@
-﻿"""
+"""
 LGS Hazırlık Takip Programı
 Desktop uygulaması - Soru çözüm takibi ve analiz
 """
@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 import locale
 import threading
+import time
 import json as json_module
 import re
 import pdfplumber
@@ -105,6 +106,8 @@ class LGSTakipApp:
         self._build_menu()
 
         self._build_ui()
+        # Önceki sürümlerde hatalı/eksik AI sayımıyla kaydedilen karneleri PDF metninden düzelt.
+        self._karne_kayitlarini_deterministik_yenile()
 
         # Açılışta otomatik senkronizasyon (arka plan thread'inde, UI'ı bloke etmez)
         self.root.after(500, self._baslangic_senkronizasyonu)
@@ -3379,14 +3382,24 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
 
         model_adi = db.oku_ayar("ai_model", "") or "gpt-4o-mini"
 
+        # Yeni nesil modeller max_completion_tokens kullanabilir ve temperature
+        # parametresinde yalnızca varsayılan değeri destekleyebilir.
+        yeni_nesil_onekler = ("o1", "o3", "o4", "gpt-5", "gpt-6")
+        if model_adi.startswith(yeni_nesil_onekler):
+            token_param = {"max_completion_tokens": 4096}
+            temperature_param = {}  # Parametreyi göndermemek varsayılan değeri kullanır.
+        else:
+            token_param = {"max_tokens": 4096}
+            temperature_param = {"temperature": 0.7}
+
         response = client.chat.completions.create(
             model=model_adi,
             messages=[
                 {"role": "system", "content": "Sen bir LGS eğitim koçusun. Türkçe konuş, emoji kullan, 8. sınıf öğrencisine hitap et."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7,
-            max_tokens=4096,
+            **temperature_param,
+            **token_param,
         )
         return response.choices[0].message.content or "AI yanıt üretemedi."
 
@@ -3480,6 +3493,14 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
             left_ctrl, textvariable=self.karne_donem_var,
             values=["Son 7 Gün", "Son 14 Gün", "Son 30 Gün", "Son 90 Gün", "Tümü"],
             state="readonly", width=12, font=("Segoe UI", 10),
+        ).pack(side=LEFT, padx=5)
+
+        ttkb.Label(left_ctrl, text="Kapsam:", font=("Segoe UI", 10)).pack(side=LEFT, padx=5)
+        self.karne_kapsam_var = tk.StringVar(value="Tüm Karneler")
+        ttkb.Combobox(
+            left_ctrl, textvariable=self.karne_kapsam_var,
+            values=["Tüm Karneler", "Seçili Karne(ler)"],
+            state="readonly", width=15, font=("Segoe UI", 10),
         ).pack(side=LEFT, padx=5)
 
         ttkb.Label(left_ctrl, text="Ders:", font=("Segoe UI", 10)).pack(side=LEFT, padx=5)
@@ -3639,45 +3660,103 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
 
         sinav_tarihi, kurum_adi, sinav_adi = tarih_dialog
 
-        # Progress göster
+        # Progress penceresi — adım adım ilerleme gösterimi
         progress_win = tk.Toplevel(self.root)
         progress_win.title("⏳ Karne Analiz Ediliyor...")
-        progress_win.geometry("420x130")
+        progress_win.geometry("480x220")
         progress_win.resizable(False, False)
         progress_win.transient(self.root)
         progress_win.grab_set()
         progress_win.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - 420) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - 130) // 2
+        x = self.root.winfo_x() + (self.root.winfo_width() - 480) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - 220) // 2
         progress_win.geometry(f"+{x}+{y}")
 
         pf = ttkb.Frame(progress_win, padding=20)
         pf.pack(fill=BOTH, expand=True)
         ttkb.Label(pf, text=f"📄 {dosya_adi}", font=("Segoe UI", 10, "bold")).pack()
-        ttkb.Label(pf, text="AI analiz ediyor, lütfen bekleyin...", font=("Segoe UI", 9),
-                   bootstyle="secondary").pack(pady=5)
-        progress_bar = ttkb.Progressbar(pf, mode="indeterminate", bootstyle="info")
+
+        # Adım bilgisi label
+        adim_label = ttkb.Label(pf, text="", font=("Segoe UI", 9, "bold"), bootstyle="info")
+        adim_label.pack(pady=(8, 2))
+        detay_label = ttkb.Label(pf, text="", font=("Segoe UI", 8), bootstyle="secondary")
+        detay_label.pack(pady=(0, 5))
+
+        # Determinate progress bar (5 adım)
+        progress_bar = ttkb.Progressbar(pf, mode="determinate", maximum=100, bootstyle="info-striped")
         progress_bar.pack(fill=X, pady=5)
-        progress_bar.start(15)
-        progress_win.update()
+
+        # Geçen süre label
+        sure_label = ttkb.Label(pf, text="", font=("Segoe UI", 8), bootstyle="secondary")
+        sure_label.pack()
+
+        _baslangic = [time.time()]
+
+        def _adim_guncelle(adim_no, toplam, baslik, detay=""):
+            """Progress penceresini güncelle (ana thread)."""
+            try:
+                gecen = time.time() - _baslangic[0]
+                dk, sn = divmod(int(gecen), 60)
+                sure_str = f"{dk:02d}:{sn:02d}"
+                adim_label.configure(text=f"[{adim_no}/{toplam}] {baslik}")
+                detay_label.configure(text=detay)
+                progress_bar.configure(value=int(adim_no / toplam * 100))
+                sure_label.configure(text=f"⏱ Geçen süre: {sure_str}")
+                progress_win.update()
+            except tk.TclError:
+                pass  # Pencere kapatılmış olabilir
+
+        def _adim_safe(adim_no, toplam, baslik, detay=""):
+            """Thread-safe adım güncelleyici."""
+            self.root.after(0, lambda: _adim_guncelle(adim_no, toplam, baslik, detay))
+
+        TOPLAM_ADIM = 5
 
         def islem():
             try:
+                # Adım 1: PDF metin çıkarma zaten yapıldı
+                _adim_safe(1, TOPLAM_ADIM, "✅ PDF metin çıkarma tamamlandı",
+                           f"{len(raw_text):,} karakter çıkarıldı")
+
+                # Adım 2: AI prompt hazırlanıyor
+                import time as _time
+                _time.sleep(0.4)
+                _adim_safe(2, TOPLAM_ADIM, "📝 AI prompt hazırlanıyor...",
+                           "PDF metni AI modeline gönderilmek üzere düzenleniyor")
+                _time.sleep(0.3)
+
+                # Adım 3: AI analiz (en uzun süren adım)
+                provider_adi = "OpenAI" if provider == "openai" else "Gemini"
+                _model = db.oku_ayar("ai_model", "") or ("gpt-4o-mini" if provider == "openai" else "gemini")
+                _adim_safe(3, TOPLAM_ADIM, f"🤖 AI analiz yapılıyor ({provider_adi})...",
+                           f"Model: {_model} — Bu adım birkaç dakika sürebilir")
+
                 sonuc = self._karne_ai_analiz(raw_text, provider, api_key)
-                # AI hiç ders/konu çıkaramadıysa boş kayıt oluşturma, kullanıcıyı bilgilendir.
+
+                # AI hiç ders/konu çıkaramadıysa boş kayıt oluşturma
                 if not sonuc.get("dersler") and not sonuc.get("konular"):
                     self.root.after(0, lambda: self._karne_bos_sonuc(
                         dosya_adi, raw_text, sonuc, progress_win))
                     return
-                # RAG: chunk + embed (opsiyonel, hata durumunda atla)
+
+                # Adım 4: RAG embedding
                 rag_data = None
                 try:
+                    _adim_safe(4, TOPLAM_ADIM, "🔍 RAG embedding oluşturuluyor...",
+                               "Karne verileri aranabilir hale getiriliyor")
                     chunks = self._rag_chunk_text(raw_text)
                     embeddings = self._rag_embed_chunks(chunks, provider, api_key)
                     if embeddings:
                         rag_data = (chunks, embeddings, provider)
                 except Exception:
                     pass  # Embedding hatası karne kaydını engellemez
+
+                # Adım 5: Veritabanına kaydetme
+                ders_sayisi = len(sonuc.get("dersler", []))
+                konu_sayisi = len(sonuc.get("konular", []))
+                _adim_safe(5, TOPLAM_ADIM, "💾 Veritabanına kaydediliyor...",
+                           f"{ders_sayisi} ders, {konu_sayisi} konu analizi")
+
                 self.root.after(0, lambda: self._karne_kaydet(
                     dosya_adi, sinav_tarihi, kurum_adi, sinav_adi, raw_text, sonuc, rag_data, progress_win))
             except Exception as e:
@@ -3750,16 +3829,118 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         dialog.wait_window()
         return result[0]
 
+    def _karne_metninden_dogrulanabilir_veri(self, raw_text: str) -> dict:
+        """Karne tablosundaki öğrenci cevabı/cevap anahtarını satır bazında okuyup sayıları deterministik hesaplar.
+
+        AI'dan sayım yapmasını istemek yerine, PDF'de görünen cevapları doğrudan karşılaştırır.
+        Aynı sorunun PDF metninde tekrar eden tablo kopyaları soru numarası bazında tekilleştirilir.
+        """
+        ders_alias = {
+            "turkce": "Türkçe", "türkçe": "Türkçe",
+            "matematik": "Matematik", "fen": "Fen", "fen bilimleri": "Fen",
+            "sosyal": "Sosyal", "sosyal bilgiler": "Sosyal", "inkılap": "Sosyal",
+            "inkilap": "Sosyal", "t.c. inkılap tarihi ve atatürkçülük": "Sosyal",
+            "ingilizce": "İngilizce", "english / ingilizce": "İngilizce",
+            "din": "Din", "din kültürü": "Din",
+            "din kültürü ve ahlak bilgisi": "Din",
+        }
+        def norm(s):
+            value = re.sub(r"\s+", " ", (s or "").strip()).casefold()
+            # Türkçe büyük I/İ harfleri casefold sonrası farklı biçimlere dönüşebilir.
+            value = value.replace("i\u0307", "i").translate(str.maketrans({"ı":"i", "ü":"u", "ö":"o", "ş":"s", "ç":"c", "ğ":"g"}))
+            return value
+        def course_from_heading(line):
+            h = norm(line).strip(" :|-_")
+            if h in ("turkce", "turkce grubu"): return "Türkçe"
+            if "inkilap tarihi" in h or h in ("sosyal", "sosyal bilgiler"): return "Sosyal"
+            if h in ("fen bilimleri", "fen"): return "Fen"
+            if h in ("matematik", "matematik grubu"): return "Matematik"
+            if h in ("english / ingilizce", "ingilizce", "yabanci dil grubu"): return "İngilizce"
+            if "din kulturu ve ahlak bilgisi" in h or h in ("din", "din kulturu"): return "Din"
+            return None
+
+        # Key: (ders, soru no), preventing duplicated extraction-table rows from double counting.
+        questions = {}
+        active_course = None
+        row_re = re.compile(r"^\s*(\d{1,2})\s+(.+?)\s+([A-D])\s+([A-D])\s*$", re.IGNORECASE)
+        for line in (raw_text or "").splitlines():
+            heading = course_from_heading(line)
+            if heading:
+                active_course = heading
+                continue
+            if not active_course:
+                continue
+            m = row_re.match(line)
+            if not m:
+                continue
+            qno = int(m.group(1))
+            topic = re.sub(r"\s+", " ", m.group(2)).strip(" .|\t")
+            student = m.group(3).upper()
+            answer_key = m.group(4).upper()
+            if not topic or topic.casefold() in ("konu", "no konu -", "no konu - cö ac"):
+                continue
+            # PDF question numbering is per subject; only the first valid occurrence is used.
+            questions.setdefault((active_course, qno), {
+                "ders": active_course, "soru_no": qno, "konu": topic,
+                "ogrenci_cevabi": student, "dogru_cevap": answer_key,
+                "durum": "dogru" if student == answer_key else "yanlis",
+            })
+
+        if not questions:
+            return {"dersler": [], "konular": [], "sorular": []}
+
+        course_counts = {}
+        topic_counts = {}
+        for q in questions.values():
+            d = q["ders"]
+            c = course_counts.setdefault(d, {"ders": d, "soru_sayisi": 0, "dogru": 0, "yanlis": 0, "bos": 0, "net": 0.0, "basari_yuzdesi": 0.0})
+            c["soru_sayisi"] += 1
+            c[q["durum"]] += 1
+            topic_key = (d, q["konu"])
+            t = topic_counts.setdefault(topic_key, {"ders": d, "konu": q["konu"], "kazanim": q["konu"], "dogru": 0, "yanlis": 0, "bos": 0, "toplam": 0})
+            t["toplam"] += 1
+            t[q["durum"]] += 1
+
+        for c in course_counts.values():
+            c["net"] = round(c["dogru"] - c["yanlis"] / 3.0, 2)
+            c["basari_yuzdesi"] = round(c["dogru"] / c["soru_sayisi"] * 100, 1) if c["soru_sayisi"] else 0.0
+        return {
+            "dersler": sorted(course_counts.values(), key=lambda x: x["ders"]),
+            "konular": sorted(topic_counts.values(), key=lambda x: (x["ders"], x["konu"])),
+            "sorular": sorted(questions.values(), key=lambda x: (x["ders"], x["soru_no"])),
+        }
+
+    def _karne_kayitlarini_deterministik_yenile(self):
+        """Mevcut kayıtları PDF metnindeki cevaplardan tekrar hesapla; AI özetini sayısal kaynak yapma."""
+        try:
+            for karne in db.karneleri_getir(None):
+                raw = karne.get("raw_text") or ""
+                parsed = self._karne_metninden_dogrulanabilir_veri(raw)
+                if not parsed["dersler"] or not parsed["konular"]:
+                    continue
+                mevcut = db.karne_detay_getir(karne["id"])
+                if not mevcut:
+                    continue
+                mevcut_ders = {d["ders"]: (int(d["soru_sayisi"]), int(d["dogru"]), int(d["yanlis"]), int(d["bos"])) for d in mevcut["dersler"]}
+                yeni_ders = {d["ders"]: (int(d["soru_sayisi"]), int(d["dogru"]), int(d["yanlis"]), int(d["bos"])) for d in parsed["dersler"]}
+                mevcut_konu = sorted((k["ders"], k["konu"], int(k["dogru"]), int(k["yanlis"]), int(k["bos"]), int(k["toplam"])) for k in mevcut["konular"])
+                yeni_konu = sorted((k["ders"], k["konu"], int(k["dogru"]), int(k["yanlis"]), int(k["bos"]), int(k["toplam"])) for k in parsed["konular"])
+                if mevcut_ders != yeni_ders or mevcut_konu != yeni_konu:
+                    db.karne_analizini_yenile(karne["id"], parsed["dersler"], parsed["konular"])
+        except Exception as exc:
+            # Uygulamanın açılmasını yalnızca eski bir kayıt onarımı yüzünden engelleme.
+            print(f"Karne analiz onarımı atlandı: {exc}")
+
     def _karne_ai_analiz(self, raw_text: str, provider: str, api_key: str) -> dict:
         """PDF metnini AI ile analiz edip yapılandırılmış veri döndür."""
         prompt = f"""Aşağıda bir LGS deneme sınavı karne PDF'inden çıkartılmış metin var. Bu metinden aşağıdaki yapıda JSON veri çıkar.
 
 ## Kurallar:
 - Tam olarak JSON formatında yanıt ver, başka metin ekleme
-- Dersler: Türkçe, Matematik, Fen, İnkılap, İngilizce, Din (standartlaştır)
-- Her ders için doğru/yanlış/boş/net bilgilerini çıkar
-- Her ders altındaki konu/kazanım analizini çıkar
-- Konu analizinde öğrencinin hangi konularda doğru/yanlış/boş yaptığını belirt
+- Dersler: Türkçe, Matematik, Fen, Sosyal, İngilizce, Din (İnkılap Tarihi dersini Sosyal olarak kaydet)
+- Sayısal değerleri tahmin etme; öğrenci cevapları ve cevap anahtarı metinde görünüyorsa yalnızca bunları karşılaştır.
+- Konu/kazanım adlarını PDF satırlarından aynen al.
+- Belirsiz veya görünmeyen cevaplar için sonuç uydurma.
 - Eğer kazanım bilgisi varsa (K1, K2 gibi) kazanim alanına yaz
 - Eğer bazı bilgiler PDF'de yoksa 0 olarak işaretle
 
@@ -3793,7 +3974,7 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
 ```
 
 ## PDF Metni:
-{raw_text[:8000]}
+{raw_text[:18000]}
 """
 
         if provider == "openai":
@@ -3801,6 +3982,11 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
 
             client = OpenAI(api_key=api_key)
             model_adi = db.oku_ayar("ai_model", "") or "gpt-4o-mini"
+            # Yeni nesil modeller max_completion_tokens kullanabilir.
+            # gpt-5/o-serisi temperature=0.1 değerini kabul etmediği için parametreyi atla.
+            _yeni = ("o1", "o3", "o4", "gpt-5", "gpt-6")
+            _tkp = {"max_completion_tokens": 8192} if model_adi.startswith(_yeni) else {"max_tokens": 8192}
+            _temp = {} if model_adi.startswith(_yeni) else {"temperature": 0.1}
             response = client.chat.completions.create(
                 model=model_adi,
                 messages=[
@@ -3810,9 +3996,9 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
                     },
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.1,
-                max_tokens=8192,
                 response_format={"type": "json_object"},
+                **_temp,
+                **_tkp,
             )
             yanit = self._ai_response_to_text(response.choices[0].message.content)
         else:
@@ -3835,7 +4021,19 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
             )
             yanit = self._gemini_response_to_text(response)
 
-        sonuc = self._parse_karne_ai_json(yanit)
+        # Önce sayısal kaynak olan PDF tablosunu çöz; AI yanıtı sayımın doğruluğunu belirlemesin.
+        dogrulanabilir = self._karne_metninden_dogrulanabilir_veri(raw_text)
+        try:
+            sonuc = self._parse_karne_ai_json(yanit)
+        except Exception:
+            if not dogrulanabilir["dersler"] or not dogrulanabilir["konular"]:
+                raise
+            sonuc = {"dersler": [], "konular": [], "ozet": "Sayısal sonuçlar PDF'deki öğrenci cevapları ve cevap anahtarı karşılaştırılarak hesaplandı."}
+        # AI yalnızca açıklayıcı özet üretebilir; ders/konu sayıları deterministik sonuçla ezilir.
+        if dogrulanabilir["dersler"] and dogrulanabilir["konular"]:
+            sonuc["dersler"] = dogrulanabilir["dersler"]
+            sonuc["konular"] = dogrulanabilir["konular"]
+            sonuc["sorular"] = dogrulanabilir["sorular"]
         # Boş analiz durumunda gerçek AI yanıtını debug için sakla.
         # Bu alan yalnızca dahili hata ayıklama amacıyla kullanılır.
         sonuc["_raw_ai_response"] = yanit
@@ -3901,12 +4099,12 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
             "matematik": "Matematik",
             "fen": "Fen",
             "fen bilimleri": "Fen",
-            "sosyal": "İnkılap",
-            "sosyal bilgiler": "İnkılap",
-            "inkılap": "İnkılap",
-            "inkilap": "İnkılap",
-            "t.c. inkılap tarihi ve atatürkçülük": "İnkılap",
-            "inkılap tarihi": "İnkılap",
+            "sosyal": "Sosyal",
+            "sosyal bilgiler": "Sosyal",
+            "inkılap": "Sosyal",
+            "inkilap": "Sosyal",
+            "t.c. inkılap tarihi ve atatürkçülük": "Sosyal",
+            "inkılap tarihi": "Sosyal",
             "ingilizce": "İngilizce",
             "i̇ngilizce": "İngilizce",
             "din": "Din",
@@ -4308,25 +4506,34 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         ders = self.karne_ders_var.get()
 
         # Veri kontrolü
-        karneler = db.karneleri_getir(son_gun)
+        secili_ids = [int(x) for x in self.karne_tree.selection()] if self.karne_kapsam_var.get() == "Seçili Karne(ler)" else []
+        if self.karne_kapsam_var.get() == "Seçili Karne(ler)" and not secili_ids:
+            messagebox.showinfo("Karne Seçimi", "Seçili Karne(ler) kapsamı için soldaki listeden bir veya daha fazla karne seçin.")
+            return
+        karneler = [k for k in db.karneleri_getir(None) if k["id"] in secili_ids] if secili_ids else db.karneleri_getir(son_gun)
         if not karneler:
             messagebox.showinfo("Bilgi", "Seçili dönemde karne bulunamadı.\n\n"
                                "Önce 'PDF Yükle' butonuyla karne yükleyin.")
             return
 
-        self._karne_konu_raporu_goster(son_gun, ders)
-        self._karne_ders_ozet_goster(son_gun, ders)
-        self._karne_gelisim_goster(ders)
+        scope_label = "Seçili karne(ler)" if secili_ids else "Tüm karneler (dönem filtresi)"
+        self._karne_konu_raporu_goster(None if secili_ids else son_gun, ders, secili_ids or None)
+        self._karne_ders_ozet_goster(son_gun, ders, secili_ids or None)
+        self._karne_gelisim_goster(ders, secili_ids or None)
+        try:
+            self.karne_notebook.tab(0, text=f"  ❌ Konu Hata Raporu · {scope_label}  ")
+        except Exception:
+            pass
 
         # Konu Hata Raporu sekmesine geç
         self.karne_notebook.select(0)
 
-    def _karne_konu_raporu_goster(self, son_gun, ders):
+    def _karne_konu_raporu_goster(self, son_gun, ders, karne_ids=None):
         """Konu bazlı hata raporu."""
         for w in self.karne_konu_frame.winfo_children():
             w.destroy()
 
-        rapor = db.karne_konu_raporu(son_gun, ders)
+        rapor = db.karne_konu_raporu(son_gun, ders, karne_ids)
         if not rapor:
             ttkb.Label(self.karne_konu_frame, text="📭 Henüz karne verisi yok.\nPDF yükleyerek başlayın.",
                        font=("Segoe UI", 12), bootstyle="secondary").pack(expand=True)
@@ -4394,12 +4601,12 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         ttkb.Label(ozet_frame, text=f"🟢 İyi: {toplam_konu - kritik - uyari}",
                    font=("Segoe UI", 9, "bold"), foreground="#27ae60").pack(side=LEFT)
 
-    def _karne_ders_ozet_goster(self, son_gun, ders):
+    def _karne_ders_ozet_goster(self, son_gun, ders, karne_ids=None):
         """Ders bazlı özet grafik ve tablo."""
         for w in self.karne_ders_frame.winfo_children():
             w.destroy()
 
-        karneler = db.karneleri_getir(son_gun)
+        karneler = [k for k in db.karneleri_getir(None) if k["id"] in karne_ids] if karne_ids else db.karneleri_getir(son_gun)
         if not karneler:
             ttkb.Label(self.karne_ders_frame, text="📭 Henüz karne verisi yok.",
                        font=("Segoe UI", 12), bootstyle="secondary").pack(expand=True)
@@ -4467,12 +4674,12 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         canvas.draw()
         canvas.get_tk_widget().pack(fill=BOTH, expand=True)
 
-    def _karne_gelisim_goster(self, ders):
+    def _karne_gelisim_goster(self, ders, karne_ids=None):
         """Karne bazlı gelişim grafiği."""
         for w in self.karne_gelisim_frame.winfo_children():
             w.destroy()
 
-        rapor = db.karne_gelisim_raporu(ders)
+        rapor = db.karne_gelisim_raporu(ders, karne_ids)
         if not rapor:
             ttkb.Label(self.karne_gelisim_frame, text="📭 Gelişim raporu için en az 2 karne gerekli.",
                        font=("Segoe UI", 12), bootstyle="secondary").pack(expand=True)
@@ -4795,6 +5002,9 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
                     context_parts.append(f"{kaynak}\n{chunk['chunk_text']}")
 
                 context = "\n\n---\n\n".join(context_parts)
+                # Vektör araması tek bir dersin chunk'larını seçse bile, tüm derslerin kayıtlı
+                # sayısal performansı her sorguda bağlamda bulunsun.
+                context = self._rag_yapilandirilmis_performans() + "\n\nİlgili karne metin parçaları:\n" + context
 
                 # 6. AI'ya gönder
                 yanit = self._rag_ai_sorgula(soru, context, provider, api_key)
@@ -4830,6 +5040,7 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
                             combined += header + raw[:remaining] + "\n"
                         break
 
+                combined = self._rag_yapilandirilmis_performans() + "\n\nHam karne metinleri:\n" + combined
                 yanit = self._rag_ai_sorgula(soru, combined, provider, api_key)
                 self.root.after(0, lambda: self._rag_sonuc_goster(yanit, len(karneler)))
             except Exception as e:
@@ -4839,19 +5050,39 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         thread = threading.Thread(target=islem, daemon=True)
         thread.start()
 
+    def _rag_yapilandirilmis_performans(self) -> str:
+        """Tüm kayıtlı karnelerin tüm ders ve konu performansını bilgi bankası bağlamına ekle."""
+        lines = ["KAYITLI KARNELERİN YAPILANDIRILMIŞ PERFORMANSI (tüm dersler):"]
+        for karne in db.karneleri_getir(None):
+            detay = db.karne_detay_getir(karne["id"])
+            if not detay:
+                continue
+            k = detay["karne"]
+            lines.append(f"\nSINAV: {k.get('sinav_tarihi','')} | {k.get('sinav_adi') or k.get('dosya_adi','')} | {k.get('kurum_adi','')}")
+            for d in detay["dersler"]:
+                lines.append(f"DERS {d['ders']}: {d['dogru']} doğru, {d['yanlis']} yanlış, {d['bos']} boş / {d['soru_sayisi']} soru; net {d['net']:.2f}; başarı %{d['basari_yuzdesi']:.1f}.")
+            for konu in detay["konular"]:
+                toplam = max(1, konu.get("toplam", 0))
+                hata = konu.get("yanlis", 0) + konu.get("bos", 0)
+                lines.append(f"KONU {konu['ders']} — {konu['konu']}: {konu['dogru']} doğru, {konu['yanlis']} yanlış, {konu['bos']} boş / {konu['toplam']} soru; hata oranı %{hata / toplam * 100:.1f}.")
+        return "\n".join(lines)[:14000]
+
     def _rag_ai_sorgula(self, soru: str, context: str, provider: str, api_key: str) -> str:
         """RAG sorgusu: context + soru → AI yanıt."""
         prompt = f"""Aşağıda bir öğrencinin LGS deneme sınavı karnelerinden çıkarılmış bilgiler var.
 Bu bilgileri kullanarak soruyu detaylı ve Türkçe olarak yanıtla.
 
 ## Karne Bilgileri:
-{context[:10000]}
+{context[:18000]}
 
 ## Soru:
 {soru}
 
 ## Kurallar:
-- Sadece verilen karne bilgilerine dayanarak yanıt ver
+- Sadece verilen karne bilgilerine dayanarak yanıt ver; kayıtlı yapılandırılmış performans satırlarını mutlaka kullan.
+- Soru belirli bir dersle sınırlı değilse Türkçe, Matematik, Fen, Sosyal/İnkılap, İngilizce ve Din derslerinin tümünü değerlendir.
+- Tek karne ile tüm karnelerin kümülatif sonuçlarını birbirine karıştırma; sınav ve örneklem sayısını belirt.
+- Yüzdeyi doğru / (doğru + yanlış + boş) olarak hesapla; veri eksikse açıkça belirt ve tahmin etme.
 - Somut veriler ve yüzdeler kullan
 - Emoji kullanarak okunabilirliği artır
 - LGS perspektifinden değerlendir
@@ -4861,14 +5092,19 @@ Bu bilgileri kullanarak soruyu detaylı ve Türkçe olarak yanıtla.
             from openai import OpenAI
             client = OpenAI(api_key=api_key)
             model_adi = db.oku_ayar("ai_model", "") or "gpt-4o-mini"
+            # Yeni nesil modeller max_completion_tokens kullanabilir.
+            # Bu modeller temperature parametresini varsayılan dışında kabul etmeyebilir.
+            _yeni = ("o1", "o3", "o4", "gpt-5", "gpt-6")
+            _tkp = {"max_completion_tokens": 4096} if model_adi.startswith(_yeni) else {"max_tokens": 4096}
+            _temp = {} if model_adi.startswith(_yeni) else {"temperature": 0.5}
             response = client.chat.completions.create(
                 model=model_adi,
                 messages=[
                     {"role": "system", "content": "Sen bir LGS eğitim uzmanısın. Öğrencinin karne verilerini analiz edip Türkçe yanıt veriyorsun."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.5,
-                max_tokens=4096)
+                **_temp,
+                **_tkp)
             return response.choices[0].message.content or "Yanıt üretilemedi."
         else:
             import google.generativeai as genai

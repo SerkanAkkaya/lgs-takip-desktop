@@ -1046,6 +1046,126 @@ def karne_konu_ekle(karne_id: int, ders: str, konu: str, kazanim: str = "",
     return last_id
 
 
+
+def karne_analizini_yenile(karne_id: int, dersler: list, konular: list):
+    """Bir karneye ait ders ve konu analizlerini yeniden hesaplanan verilerle değiştir.
+
+    PDF'den doğrulanmış/yeniden çıkarılmış analiz sonuçlarını kaydetmek için kullanılır.
+    Mevcut veritabanı şemasını değiştirmez.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id FROM karneler WHERE id = ?", (karne_id,))
+        if not cursor.fetchone():
+            raise ValueError(f"Karne bulunamadı: {karne_id}")
+
+        cursor.execute("DELETE FROM karne_konu_analizi WHERE karne_id = ?", (karne_id,))
+        cursor.execute("DELETE FROM karne_ders_analizi WHERE karne_id = ?", (karne_id,))
+
+        for d in dersler or []:
+            soru_sayisi = int(d.get("soru_sayisi", 0) or 0)
+            dogru = int(d.get("dogru", 0) or 0)
+            yanlis = int(d.get("yanlis", 0) or 0)
+            bos = int(d.get("bos", 0) or 0)
+            basari = d.get("basari_yuzdesi")
+            if basari is None:
+                basari = (dogru / soru_sayisi * 100) if soru_sayisi else 0
+            net = d.get("net")
+            if net is None:
+                net = dogru - (yanlis / 3.0)
+
+            cursor.execute("""
+                INSERT INTO karne_ders_analizi
+                    (karne_id, ders, soru_sayisi, dogru, yanlis, bos, net, basari_yuzdesi)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                karne_id, str(d.get("ders", "")).strip(), soru_sayisi,
+                dogru, yanlis, bos, round(float(net or 0), 2),
+                round(float(basari or 0), 1),
+            ))
+
+        for k in konular or []:
+            dogru = int(k.get("dogru", 0) or 0)
+            yanlis = int(k.get("yanlis", 0) or 0)
+            bos = int(k.get("bos", 0) or 0)
+            toplam = int(k.get("toplam", dogru + yanlis + bos) or 0)
+            cursor.execute("""
+                INSERT INTO karne_konu_analizi
+                    (karne_id, ders, konu, kazanim, dogru, yanlis, bos, toplam)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                karne_id, str(k.get("ders", "")).strip(),
+                str(k.get("konu", "")).strip(), str(k.get("kazanim", "") or "").strip(),
+                dogru, yanlis, bos, toplam,
+            ))
+
+        # ai_ozet alanını sayısal sonuçlarla güncelle; yapay zekâ yorumunu veri yerine koyma.
+        ozet_satirlari = []
+        for d in dersler or []:
+            ozet_satirlari.append(
+                f"{d.get('ders', 'Bilinmeyen ders')}: "
+                f"{int(d.get('dogru', 0) or 0)} doğru, "
+                f"{int(d.get('yanlis', 0) or 0)} yanlış, "
+                f"{int(d.get('bos', 0) or 0)} boş"
+            )
+        ozet = "Ders sonuçları yeniden hesaplandı. " + (
+            "; ".join(ozet_satirlari) if ozet_satirlari else "Ders bazında yeterli veri bulunamadı."
+        )
+        cursor.execute("UPDATE karneler SET ai_ozet = ? WHERE id = ?", (ozet, karne_id))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def karne_ders_performans_ozeti(karne_ids: list = None, son_gun: int = None) -> list:
+    """Tüm derslerin karne bazlı/kümülatif performansını döndür.
+
+    karne_ids=None ise tüm karneler; belirli ID listesi verilirse yalnızca o karneler.
+    Sonuçlar her ders için soru ağırlıklı başarı yüzdesi içerir.
+    """
+    if karne_ids is not None and not karne_ids:
+        return []
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = """
+        SELECT kda.ders,
+               COUNT(DISTINCT kda.karne_id) AS karne_sayisi,
+               SUM(kda.soru_sayisi) AS toplam_soru,
+               SUM(kda.dogru) AS toplam_dogru,
+               SUM(kda.yanlis) AS toplam_yanlis,
+               SUM(kda.bos) AS toplam_bos,
+               SUM(kda.net) AS toplam_net
+        FROM karne_ders_analizi kda
+        JOIN karneler k ON k.id = kda.karne_id
+        WHERE 1=1
+    """
+    params = []
+    if son_gun:
+        query += " AND k.sinav_tarihi >= date('now', '-' || ? || ' days', 'localtime')"
+        params.append(int(son_gun))
+    if karne_ids is not None:
+        placeholders = ",".join("?" for _ in karne_ids)
+        query += f" AND kda.karne_id IN ({placeholders})"
+        params.extend(int(x) for x in karne_ids)
+    query += " GROUP BY kda.ders ORDER BY kda.ders"
+
+    try:
+        cursor.execute(query, params)
+        rows = [dict(row) for row in cursor.fetchall()]
+        for row in rows:
+            toplam = int(row.get("toplam_soru") or 0)
+            dogru = int(row.get("toplam_dogru") or 0)
+            row["basari_yuzdesi"] = round(dogru / toplam * 100, 1) if toplam else 0.0
+        return rows
+    finally:
+        conn.close()
+
+
 def karne_sil(karne_id: int):
     """Karne ve tüm alt kayıtlarını sil."""
     conn = get_connection()
@@ -1099,7 +1219,7 @@ def karne_detay_getir(karne_id: int):
     return None
 
 
-def karne_konu_raporu(son_gun: int = None, ders: str = None):
+def karne_konu_raporu(son_gun: int = None, ders: str = None, karne_ids: list = None):
     """Konu bazlı hata raporu — tüm karneler üzerinden toplu analiz.
     
     Returns: [{ders, konu, kazanim, toplam_dogru, toplam_yanlis, toplam_bos,
@@ -1125,6 +1245,13 @@ def karne_konu_raporu(son_gun: int = None, ders: str = None):
     if ders and ders != "Tümü":
         query += " AND kka.ders = ?"
         params.append(ders)
+    if karne_ids is not None:
+        if not karne_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in karne_ids)
+        query += f" AND kka.karne_id IN ({placeholders})"
+        params.extend(int(x) for x in karne_ids)
 
     query += " GROUP BY kka.ders, kka.konu, kka.kazanim ORDER BY kka.ders, SUM(kka.yanlis) DESC"
     cursor.execute(query, params)
@@ -1140,7 +1267,7 @@ def karne_konu_raporu(son_gun: int = None, ders: str = None):
     return result
 
 
-def karne_gelisim_raporu(ders: str = None):
+def karne_gelisim_raporu(ders: str = None, karne_ids: list = None):
     """Karne bazlı gelişim raporu — tarih sıralı ders başarı oranları.
     
     Returns: [{sinav_tarihi, sinav_adi, kurum_adi, ders, soru_sayisi, dogru, yanlis, bos, net, basari}]
@@ -1159,6 +1286,13 @@ def karne_gelisim_raporu(ders: str = None):
     if ders and ders != "Tümü":
         query += " AND kda.ders = ?"
         params.append(ders)
+    if karne_ids is not None:
+        if not karne_ids:
+            conn.close()
+            return []
+        placeholders = ",".join("?" for _ in karne_ids)
+        query += f" AND k.id IN ({placeholders})"
+        params.extend(int(x) for x in karne_ids)
     query += " ORDER BY k.sinav_tarihi ASC, kda.ders"
     cursor.execute(query, params)
     rows = cursor.fetchall()

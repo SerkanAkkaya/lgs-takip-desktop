@@ -1,1 +1,8 @@
 psycopg[binary]>=3.2,<4
+ttkbootstrap>=1.10,<2
+matplotlib>=3.8,<4
+numpy>=1.26,<3
+pandas>=2.1,<4
+pdfplumber>=0.11,<1
+openai>=1.30,<3
+google-generativeai>=0.8,<1
