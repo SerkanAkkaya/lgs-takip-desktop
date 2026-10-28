@@ -59,6 +59,25 @@ APP_DEVELOPER = "Serkan Akkaya"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 
+def _tarih_db_format(girdi: str):
+    """Kullanıcı girişini (gg/aa/yyyy, gg.aa.yyyy, yyyy-aa-gg) veritabanı formatına (yyyy-aa-gg) çevir."""
+    s = (girdi or "").strip()
+    for fmt in ("%d/%m/%Y", "%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _tarih_goster_format(iso: str):
+    """Veritabanı tarihini (yyyy-aa-gg) kullanıcı formatına (gg/aa/yyyy) çevir."""
+    try:
+        return datetime.strptime((iso or "").strip(), "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return iso or ""
+
+
 class LGSTakipApp:
     def __init__(self):
         # Veritabanını başlat
@@ -72,6 +91,12 @@ class LGSTakipApp:
             minsize=(1000, 700),
         )
         self.root.place_window_center()
+
+        # Türkçe karakter giriş/görüntüleme sorununu önlemek için Tk'yi UTF-8'e sabitle.
+        try:
+            self.root.tk.call("encoding", "system", "utf-8")
+        except Exception:
+            pass
 
         # Stil ayarları
         self.style = ttkb.Style()
@@ -1912,9 +1937,12 @@ class LGSTakipApp:
         tab = ttkb.Frame(self.notebook, padding=10)
         self.notebook.add(tab, text="  📑 LGS Sınavları  ")
 
-        # Üst: Sol=Form, Sağ=Liste (Panedwindow ile boyutlandırılabilir)
-        ust_paned = ttkb.Panedwindow(tab, orient=tk.HORIZONTAL)
-        ust_paned.pack(fill=BOTH, expand=True)
+        # Ana alan: üstte form/liste, altta boyutlandırılabilir sınav detayı.
+        ana_paned = ttkb.Panedwindow(tab, orient=tk.VERTICAL)
+        ana_paned.pack(fill=BOTH, expand=True)
+
+        ust_paned = ttkb.Panedwindow(ana_paned, orient=tk.HORIZONTAL)
+        ana_paned.add(ust_paned, weight=4)
 
         # ── SOL PANEL: Sınav Giriş Formu ──
         sol_frame = ttkb.Frame(ust_paned)
@@ -1952,9 +1980,13 @@ class LGSTakipApp:
         # Sınav tarihi
         ttkb.Label(form_inner, text="📅 Sınav Tarihi:", font=("Segoe UI", 10)).grid(
             row=row, column=0, sticky=W, pady=4, padx=5)
-        self.sinav_tarihi_var = tk.StringVar(value=date.today().strftime("%Y-%m-%d"))
+        self.sinav_tarihi_var = tk.StringVar(value=date.today().strftime("%d/%m/%Y"))
         ttkb.Entry(form_inner, textvariable=self.sinav_tarihi_var, font=("Segoe UI", 10), width=15).grid(
             row=row, column=1, sticky=W, pady=4, padx=5)
+        ttkb.Label(
+            form_inner, text="GG/AA/YYYY",
+            font=("Segoe UI", 8), bootstyle="secondary").grid(
+                row=row, column=2, sticky=W, pady=4, padx=3)
 
         row += 1
         # Kurum seçimi
@@ -1972,8 +2004,16 @@ class LGSTakipApp:
         ttkb.Label(form_inner, text="🎯 Puan:", font=("Segoe UI", 10)).grid(
             row=row, column=0, sticky=W, pady=4, padx=5)
         self.sinav_puan_var = tk.StringVar()
-        ttkb.Entry(form_inner, textvariable=self.sinav_puan_var, font=("Segoe UI", 10), width=12).grid(
-            row=row, column=1, sticky=W, pady=4, padx=5)
+        self._sinav_puan_elle_degisti = False
+        self._sinav_puan_programatik = False
+        puan_entry = ttkb.Entry(
+            form_inner, textvariable=self.sinav_puan_var, font=("Segoe UI", 10), width=12)
+        puan_entry.grid(row=row, column=1, sticky=W, pady=4, padx=5)
+        puan_entry.bind("<KeyRelease>", self._sinav_puan_elle_girildi)
+        ttkb.Label(
+            form_inner, text="Netlerden tahmini hesaplanır; elle değiştirebilirsiniz.",
+            font=("Segoe UI", 8), bootstyle="secondary").grid(
+                row=row, column=2, sticky=W, pady=4, padx=3)
 
         row += 1
         # Dereceler
@@ -2009,7 +2049,7 @@ class LGSTakipApp:
         ttkb.Label(ders_header, text="Net", font=("Segoe UI", 9, "bold"), width=8).grid(row=0, column=4)
 
         # LGS ders soru sayıları
-        lgs_soru = {"Türkçe": 20, "Matematik": 20, "Fen": 20, "Sosyal": 10, "İngilizce": 10, "Din": 10}
+        lgs_soru = {"Türkçe": 20, "Matematik": 20, "Fen": 20, "İnkılap": 10, "İngilizce": 10, "Din": 10}
 
         self.sinav_ders_vars = {}
         for i, ders in enumerate(DERSLER):
@@ -2037,9 +2077,10 @@ class LGSTakipApp:
             def _calc_net(ders_key=ders, *args):
                 try:
                     v = self.sinav_ders_vars[ders_key]
-                    d = int(v["d"].get() or 0)
-                    y = int(v["y"].get() or 0)
-                    net = d - (y / 3.0)
+                    d = max(0, int(v["d"].get() or 0))
+                    y = max(0, int(v["y"].get() or 0))
+                    ss = max(0, int(v["ss"].get() or 0))
+                    net = max(0.0, min(float(ss), d - (y / 3.0)))
                     v["net_lbl"].configure(text=f"{net:.2f}")
                 except ValueError:
                     pass
@@ -2056,22 +2097,37 @@ class LGSTakipApp:
             font=("Segoe UI", 14, "bold"), bootstyle="success")
         self.sinav_toplam_net_lbl.pack(side=LEFT, padx=10)
 
-        # Toplam net otomatik hesaplama
+        # Toplam net ve yaklaşık puan otomatik hesaplanır.
         def _calc_toplam(*args):
             toplam = 0.0
+            agirlikli_net = 0.0
+            agirliklar = {
+                "Türkçe": 4, "Matematik": 4, "Fen": 4,
+                "İnkılap": 1, "İngilizce": 1, "Din": 1,
+            }
             for ders in DERSLER:
                 try:
                     v = self.sinav_ders_vars[ders]
-                    d = int(v["d"].get() or 0)
-                    y = int(v["y"].get() or 0)
-                    toplam += d - (y / 3.0)
+                    d = max(0, int(v["d"].get() or 0))
+                    y = max(0, int(v["y"].get() or 0))
+                    ss = max(0, int(v["ss"].get() or 0))
+                    net = max(0.0, min(float(ss), d - (y / 3.0)))
+                    toplam += net
+                    agirlikli_net += net * agirliklar.get(ders, 1)
                 except ValueError:
                     pass
             self.sinav_toplam_net_lbl.configure(text=f"{toplam:.2f}")
+            if not getattr(self, "_sinav_puan_elle_degisti", False):
+                # Bu yaklaşık bir göstergedir; resmî LGS puanı değildir.
+                tahmini_puan = max(100.0, min(500.0, 100.0 + (agirlikli_net / 270.0) * 400.0))
+                self._sinav_puan_programatik = True
+                self.sinav_puan_var.set(f"{tahmini_puan:.2f}")
+                self._sinav_puan_programatik = False
 
         for ders in DERSLER:
             self.sinav_ders_vars[ders]["d"].trace_add("write", _calc_toplam)
             self.sinav_ders_vars[ders]["y"].trace_add("write", _calc_toplam)
+            self.sinav_ders_vars[ders]["ss"].trace_add("write", _calc_toplam)
 
         row += 1
         # Butonlar
@@ -2141,6 +2197,13 @@ class LGSTakipApp:
                     "Derece Gelişimi (Line)", "Ders Netleri Karşılaştırma (Bar)"],
             state="readonly", font=("Segoe UI", 10), width=28).pack(side=LEFT, padx=5)
 
+        ttkb.Label(gf_filter, text="Sınav:", font=("Segoe UI", 10)).pack(side=LEFT, padx=5)
+        self.sinav_grafik_limit_var = tk.StringVar(value="Tümü")
+        ttkb.Combobox(
+            gf_filter, textvariable=self.sinav_grafik_limit_var,
+            values=["Tümü", "Son 5", "Son 10"],
+            state="readonly", font=("Segoe UI", 10), width=8).pack(side=LEFT, padx=5)
+
         ttkb.Button(gf_filter, text="📊 Göster",
             command=self._sinav_grafik_guncelle, bootstyle="success").pack(side=LEFT, padx=10)
 
@@ -2194,12 +2257,25 @@ class LGSTakipApp:
             )
             self.sinav_tablo.column(col, width=w, anchor=CENTER if col != "sinav" else W)
 
-        # Filtreye göre listelenen sınav sayısı.
-        self.sinav_sayisi_label = ttkb.Label(
-            sag_frame, text="Toplam sınav: 0",
-            font=("Segoe UI", 9, "bold"), bootstyle="primary"
-        )
-        self.sinav_sayisi_label.pack(side=BOTTOM, anchor=E, fill=X, pady=(6, 0))
+        # Excel benzeri zebra desen: satır geçişleri kolay fark edilsin (pastel).
+        self.sinav_tablo.tag_configure("evenrow", background="#ffffff")
+        self.sinav_tablo.tag_configure("oddrow", background="#eaf2fb")
+
+        # Özet paneli: toplam / ortalama puan / ortalama net ayrı renklerle vurgulanır.
+        ozet_frame = ttkb.Frame(sag_frame)
+        ozet_frame.pack(side=BOTTOM, fill=X, pady=(6, 0))
+        self.sinav_ozet_toplam_lbl = ttkb.Label(
+            ozet_frame, text="📊 Toplam Sınav: 0", font=("Segoe UI", 10, "bold"),
+            bootstyle="inverse-primary", anchor=CENTER)
+        self.sinav_ozet_toplam_lbl.pack(fill=X, pady=(0, 2))
+        self.sinav_ozet_puan_lbl = ttkb.Label(
+            ozet_frame, text="🎯 Ort. Puan →  -", font=("Segoe UI", 9, "bold"),
+            bootstyle="inverse-success", anchor=W)
+        self.sinav_ozet_puan_lbl.pack(fill=X, pady=1)
+        self.sinav_ozet_net_lbl = ttkb.Label(
+            ozet_frame, text="📈 Ort. Net →  -", font=("Segoe UI", 9, "bold"),
+            bootstyle="inverse-info", anchor=W)
+        self.sinav_ozet_net_lbl.pack(fill=X, pady=1)
 
         sinav_scroll = ttkb.Scrollbar(sag_frame, orient=VERTICAL, command=self.sinav_tablo.yview)
         self.sinav_tablo.configure(yscrollcommand=sinav_scroll.set)
@@ -2207,13 +2283,36 @@ class LGSTakipApp:
         sinav_scroll.pack(side=RIGHT, fill=Y)
 
         # Alt: Sınav detayı
-        self.sinav_detay_frame = ttkb.Labelframe(tab, text="Sınav Detayı", padding=10, bootstyle="secondary")
-        self.sinav_detay_frame.pack(fill=X, pady=(5, 0))
+        self.sinav_detay_frame = ttkb.Labelframe(
+            ana_paned, text="Sınav Detayı (ayırıcıyı sürükleyerek boyutlandırın)",
+            padding=8, bootstyle="secondary")
+        ana_paned.add(self.sinav_detay_frame, weight=1)
 
+        detay_text_frame = ttkb.Frame(self.sinav_detay_frame)
+        detay_text_frame.pack(fill=BOTH, expand=True)
         self.sinav_detay_text = tk.Text(
-            self.sinav_detay_frame, wrap=tk.WORD, font=("Segoe UI", 9),
-            bg="#f8f9fa", fg="#2c3e50", relief=tk.FLAT, height=5, padx=8, pady=5)
-        self.sinav_detay_text.pack(fill=X)
+            detay_text_frame, wrap=tk.NONE, font=("Consolas", 10),
+            bg="#ffffff", fg="#2c3e50", relief=tk.FLAT, height=7, padx=8, pady=5)
+        # Okunur tablo için renk/stil etiketleri.
+        self.sinav_detay_text.tag_configure("baslik", font=("Segoe UI", 11, "bold"),
+            foreground="#1b4f72", background="#d6eaf8", spacing1=3, spacing3=3)
+        self.sinav_detay_text.tag_configure("dereceler", font=("Segoe UI", 9, "bold"),
+            foreground="#7d6608", background="#fcf3cf", spacing1=2, spacing3=2)
+        self.sinav_detay_text.tag_configure("thead", font=("Consolas", 10, "bold"),
+            foreground="#ffffff", background="#34495e")
+        self.sinav_detay_text.tag_configure("row_even", background="#ffffff")
+        self.sinav_detay_text.tag_configure("row_odd", background="#eef3fb")
+        self.sinav_detay_text.tag_configure("toplam", font=("Consolas", 10, "bold"),
+            foreground="#1e8449", background="#d5f5e3")
+        detay_scroll_y = ttkb.Scrollbar(
+            detay_text_frame, orient=VERTICAL, command=self.sinav_detay_text.yview)
+        detay_scroll_x = ttkb.Scrollbar(
+            self.sinav_detay_frame, orient=HORIZONTAL, command=self.sinav_detay_text.xview)
+        self.sinav_detay_text.configure(
+            yscrollcommand=detay_scroll_y.set, xscrollcommand=detay_scroll_x.set)
+        self.sinav_detay_text.pack(side=LEFT, fill=BOTH, expand=True)
+        detay_scroll_y.pack(side=RIGHT, fill=Y)
+        detay_scroll_x.pack(fill=X)
         self.sinav_detay_text.configure(state=tk.DISABLED)
 
         # Sınav seçildiğinde detay göster
@@ -2305,6 +2404,11 @@ class LGSTakipApp:
         ttkb.Button(dlg, text="Kaydet", command=_kaydet, bootstyle="success").pack(pady=5)
 
     # ── Sınav CRUD ──
+    def _sinav_puan_elle_girildi(self, event=None):
+        """Kullanıcı puanı elle yazarsa otomatik güncellemeyi durdur."""
+        if not getattr(self, "_sinav_puan_programatik", False):
+            self._sinav_puan_elle_degisti = True
+
     def _sinav_kaydet(self):
         """Sınav kaydını ekle veya güncelle."""
         sinav_adi = self.sinav_adi_var.get().strip()
@@ -2312,9 +2416,13 @@ class LGSTakipApp:
             Messagebox.show_error("Sınav adı boş olamaz!", "Hata")
             return
 
-        sinav_tarihi = self.sinav_tarihi_var.get().strip()
-        if not sinav_tarihi:
+        sinav_tarihi_girdi = self.sinav_tarihi_var.get().strip()
+        if not sinav_tarihi_girdi:
             Messagebox.show_error("Sınav tarihi boş olamaz!", "Hata")
+            return
+        sinav_tarihi = _tarih_db_format(sinav_tarihi_girdi)
+        if not sinav_tarihi:
+            Messagebox.show_error("Sınav tarihi GG/AA/YYYY formatında olmalı! (örn. 15/03/2026)", "Hata")
             return
 
         # Kurum
@@ -2380,15 +2488,16 @@ class LGSTakipApp:
 
     def _sinav_formu_temizle(self):
         """Sınav formunu temizle."""
+        self._sinav_puan_elle_degisti = False
         self._sinav_edit_id = None
         self.sinav_kaydet_btn.configure(text="💾 Sınavı Kaydet")
         self.sinav_adi_var.set("")
-        self.sinav_tarihi_var.set(date.today().strftime("%Y-%m-%d"))
+        self.sinav_tarihi_var.set(date.today().strftime("%d/%m/%Y"))
         self.sinav_kurum_var.set("(Seçiniz)")
         self.sinav_puan_var.set("")
         for var in self.derece_vars.values():
             var.set("")
-        lgs_soru = {"Türkçe": 20, "Matematik": 20, "Fen": 20, "Sosyal": 10, "İngilizce": 10, "Din": 10}
+        lgs_soru = {"Türkçe": 20, "Matematik": 20, "Fen": 20, "İnkılap": 10, "İngilizce": 10, "Din": 10}
         for ders in DERSLER:
             self.sinav_ders_vars[ders]["ss"].set(str(lgs_soru.get(ders, 10)))
             self.sinav_ders_vars[ders]["d"].set("0")
@@ -2406,7 +2515,7 @@ class LGSTakipApp:
             deger, _item = kayit
             if sutun == "tarih":
                 try:
-                    return datetime.strptime(deger, "%d.%m.%Y")
+                    return datetime.strptime(deger, "%d/%m/%Y")
                 except (ValueError, TypeError):
                     return datetime.min
             if sutun in ("id", "puan", "genel", "toplam_net"):
@@ -2437,25 +2546,51 @@ class LGSTakipApp:
                     break
 
         sinavlar = db.sinavlari_getir(kurum_id=kurum_id)
-        self.sinav_sayisi_label.configure(text=f"Toplam sınav: {len(sinavlar)}")
 
-        for s in sinavlar:
+        puanlar = []  # tarihe göre yeni -> eski sırada
+        netler = []
+        for idx, s in enumerate(sinavlar):
             # Toplam net hesapla
             detay = db.sinav_detay_getir(s["id"])
             toplam_net = sum(d["net"] for d in detay["dersler"]) if detay and detay["dersler"] else 0
+            netler.append(toplam_net)
+            puanlar.append(s["puan"] if s["puan"] is not None else None)
 
-            tarih_str = datetime.strptime(s["sinav_tarihi"], "%Y-%m-%d").strftime("%d.%m.%Y")
+            tarih_str = datetime.strptime(s["sinav_tarihi"], "%Y-%m-%d").strftime("%d/%m/%Y")
             puan_str = f"{s['puan']:.1f}" if s["puan"] else "-"
             genel_str = str(s["genel_derece"]) if s["genel_derece"] else "-"
             kurum_str = s["kurum_adi"] or "-"
 
+            tag = "evenrow" if idx % 2 == 0 else "oddrow"
             self.sinav_tablo.insert("", END, values=(
                 s["id"], tarih_str, s["sinav_adi"], kurum_str,
                 puan_str, genel_str, f"{toplam_net:.1f}"
-            ))
+            ), tags=(tag,))
+
+        self._sinav_ozet_guncelle(len(sinavlar), puanlar, netler)
+
+    @staticmethod
+    def _ortalama(degerler):
+        """None olmayan değerlerin ortalaması; hiç yoksa None."""
+        gecerli = [v for v in degerler if v is not None]
+        return sum(gecerli) / len(gecerli) if gecerli else None
+
+    def _sinav_ozet_guncelle(self, toplam, puanlar, netler):
+        """Özet panelini (toplam / ort. puan / ort. net) ayrı renkli etiketlerle güncelle."""
+        def fmt(v):
+            return f"{v:.1f}" if v is not None else "-"
+        self.sinav_ozet_toplam_lbl.configure(text=f"📊 Toplam Sınav: {toplam}")
+        self.sinav_ozet_puan_lbl.configure(
+            text=f"  🎯 Ort. Puan  →  Tümü: {fmt(self._ortalama(puanlar))}   "
+                 f"|   Son 5: {fmt(self._ortalama(puanlar[:5]))}   "
+                 f"|   Son 10: {fmt(self._ortalama(puanlar[:10]))}")
+        self.sinav_ozet_net_lbl.configure(
+            text=f"  📈 Ort. Net   →  Tümü: {fmt(self._ortalama(netler))}   "
+                 f"|   Son 5: {fmt(self._ortalama(netler[:5]))}   "
+                 f"|   Son 10: {fmt(self._ortalama(netler[:10]))}")
 
     def _sinav_detay_goster(self, event=None):
-        """Seçili sınavın detaylarını göster."""
+        """Seçili sınavın detaylarını renkli, hizalı bir tablo olarak göster."""
         sel = self.sinav_tablo.selection()
         if not sel:
             return
@@ -2466,16 +2601,17 @@ class LGSTakipApp:
             return
 
         s = detay["sinav"]
-        self.sinav_detay_text.configure(state=tk.NORMAL)
-        self.sinav_detay_text.delete("1.0", tk.END)
+        t = self.sinav_detay_text
+        t.configure(state=tk.NORMAL)
+        t.delete("1.0", tk.END)
 
-        tarih_str = datetime.strptime(s["sinav_tarihi"], "%Y-%m-%d").strftime("%d.%m.%Y")
+        LINE_W = 52
+        tarih_str = datetime.strptime(s["sinav_tarihi"], "%Y-%m-%d").strftime("%d/%m/%Y")
         kurum_str = s.get("kurum_adi") or "Belirtilmemiş"
-
-        header = f"📋 {s['sinav_adi']}  |  📅 {tarih_str}  |  🏢 {kurum_str}"
+        baslik = f" 📋 {s['sinav_adi']}    📅 {tarih_str}    🏢 {kurum_str}"
         if s["puan"]:
-            header += f"  |  🎯 Puan: {s['puan']:.2f}"
-        self.sinav_detay_text.insert(tk.END, header + "\n")
+            baslik += f"    🎯 {s['puan']:.2f}"
+        t.insert(tk.END, baslik.ljust(LINE_W) + "\n", ("baslik",))
 
         # Dereceler
         dereceler = []
@@ -2485,21 +2621,23 @@ class LGSTakipApp:
         if s["kurum_derece"]: dereceler.append(f"Kurum: {s['kurum_derece']}")
         if s["sube_derece"]: dereceler.append(f"Şube: {s['sube_derece']}")
         if dereceler:
-            self.sinav_detay_text.insert(tk.END, f"🏆 Dereceler: {' | '.join(dereceler)}\n")
+            t.insert(tk.END, (" 🏆 " + "   |   ".join(dereceler)).ljust(LINE_W) + "\n", ("dereceler",))
 
-        # Ders sonuçları
+        # Ders sonuçları tablosu
         if detay["dersler"]:
-            self.sinav_detay_text.insert(tk.END, f"{'Ders':<14} {'S.Sayı':>6} {'Doğru':>6} {'Yanlış':>7} {'Net':>8}\n")
-            self.sinav_detay_text.insert(tk.END, "-" * 46 + "\n")
+            thead = f" {'Ders':<12}{'S.Sayı':>7}{'Doğru':>7}{'Yanlış':>8}{'Net':>9} "
+            t.insert(tk.END, thead.ljust(LINE_W) + "\n", ("thead",))
             toplam_net = 0
-            for d in detay["dersler"]:
-                self.sinav_detay_text.insert(tk.END,
-                    f"{d['ders']:<14} {d['soru_sayisi']:>6} {d['dogru']:>6} {d['yanlis']:>7} {d['net']:>8.2f}\n")
+            for i, d in enumerate(detay["dersler"]):
+                satir = (f" {d['ders']:<12}{d['soru_sayisi']:>7}{d['dogru']:>7}"
+                         f"{d['yanlis']:>8}{d['net']:>9.2f} ")
+                tag = "row_even" if i % 2 == 0 else "row_odd"
+                t.insert(tk.END, satir.ljust(LINE_W) + "\n", (tag,))
                 toplam_net += d["net"]
-            self.sinav_detay_text.insert(tk.END, "-" * 46 + "\n")
-            self.sinav_detay_text.insert(tk.END, f"{'TOPLAM NET':<14} {'':>6} {'':>6} {'':>7} {toplam_net:>8.2f}\n")
+            toplam_satir = f" {'TOPLAM NET':<12}{'':>7}{'':>7}{'':>8}{toplam_net:>9.2f} "
+            t.insert(tk.END, toplam_satir.ljust(LINE_W) + "\n", ("toplam",))
 
-        self.sinav_detay_text.configure(state=tk.DISABLED)
+        t.configure(state=tk.DISABLED)
 
     def _sinav_duzenle(self):
         """Seçili sınavı düzenleme moduna al."""
@@ -2514,11 +2652,12 @@ class LGSTakipApp:
             return
 
         s = detay["sinav"]
+        self._sinav_puan_elle_degisti = False
         self._sinav_edit_id = sinav_id
         self.sinav_kaydet_btn.configure(text="💾 Güncelle")
 
         self.sinav_adi_var.set(s["sinav_adi"])
-        self.sinav_tarihi_var.set(s["sinav_tarihi"])
+        self.sinav_tarihi_var.set(_tarih_goster_format(s["sinav_tarihi"]))
 
         # Kurum
         kurum_adi = s.get("kurum_adi")
@@ -2543,7 +2682,7 @@ class LGSTakipApp:
                 self.derece_vars[key].set(str(val) if val else "")
 
         # Dersler
-        lgs_soru = {"Türkçe": 20, "Matematik": 20, "Fen": 20, "Sosyal": 10, "İngilizce": 10, "Din": 10}
+        lgs_soru = {"Türkçe": 20, "Matematik": 20, "Fen": 20, "İnkılap": 10, "İngilizce": 10, "Din": 10}
         for ders in DERSLER:
             self.sinav_ders_vars[ders]["ss"].set(str(lgs_soru.get(ders, 10)))
             self.sinav_ders_vars[ders]["d"].set("0")
@@ -2607,6 +2746,14 @@ class LGSTakipApp:
 
         df = pd.DataFrame(veriler)
 
+        # Son N sınav filtresi (tarihe göre son 5 / son 10).
+        limit_sel = getattr(self, "sinav_grafik_limit_var", None)
+        if limit_sel is not None and limit_sel.get() != "Tümü":
+            n = 5 if "5" in limit_sel.get() else 10
+            uniq = df.drop_duplicates(subset=["id"]).sort_values("sinav_tarihi")
+            son_ids = uniq["id"].tolist()[-n:]
+            df = df[df["id"].isin(son_ids)].reset_index(drop=True)
+
         fig = Figure(figsize=(10, 4), dpi=100)
         fig.patch.set_facecolor("#f8f9fa")
 
@@ -2627,11 +2774,11 @@ class LGSTakipApp:
         toolbar.update()
 
     def _sinav_ciz_puan_line(self, fig, df):
-        """Sınav puan gelişimi."""
+        """Sınav puan gelişimi — tüm sınavlar tek çizgi üzerinde (kronolojik)."""
         ax = fig.add_subplot(111)
         ax.set_facecolor("#ffffff")
 
-        # Sınav bazında unique bilgi
+        # Sınav bazında unique bilgi, tarihe göre sıralı
         sinav_df = df.drop_duplicates(subset=["id"]).sort_values("sinav_tarihi")
         sinav_df = sinav_df[sinav_df["puan"].notna()]
 
@@ -2639,30 +2786,23 @@ class LGSTakipApp:
             ax.text(0.5, 0.5, "Puan verisi bulunamadı", ha="center", va="center", fontsize=14)
             return
 
-        # Kurum bazında grupla
-        if sinav_df["kurum_adi"].nunique() > 1:
-            for kurum, grp in sinav_df.groupby("kurum_adi"):
-                lbl = kurum if kurum else "Belirtilmemiş"
-                ax.plot(range(len(grp)), grp["puan"].values, marker="o", label=lbl, linewidth=2, markersize=6)
-                for i, (_, row) in enumerate(grp.iterrows()):
-                    ax.annotate(f"{row['puan']:.1f}", (i, row["puan"]),
-                        textcoords="offset points", xytext=(0, 10), ha="center", fontsize=8, fontweight="bold")
-        else:
-            x_labels = [f"{r['sinav_adi']}\n{datetime.strptime(r['sinav_tarihi'],'%Y-%m-%d').strftime('%d.%m')}" for _, r in sinav_df.iterrows()]
-            ax.plot(range(len(sinav_df)), sinav_df["puan"].values, marker="o",
-                    color="#3498DB", linewidth=2.5, markersize=7)
-            for i, (_, row) in enumerate(sinav_df.iterrows()):
-                ax.annotate(f"{row['puan']:.1f}", (i, row["puan"]),
-                    textcoords="offset points", xytext=(0, 10), ha="center",
-                    fontsize=9, fontweight="bold", color="#2c3e50")
-            ax.set_xticks(range(len(sinav_df)))
-            ax.set_xticklabels(x_labels, fontsize=8, rotation=30, ha="right")
+        # "Tümü" veya tek kurum fark etmeksizin tüm sınavlar TEK çizgide gösterilir.
+        x_labels = [
+            f"{r['sinav_adi']}\n{datetime.strptime(r['sinav_tarihi'], '%Y-%m-%d').strftime('%d/%m/%Y')}"
+            for _, r in sinav_df.iterrows()
+        ]
+        ax.plot(range(len(sinav_df)), sinav_df["puan"].values, marker="o",
+                color="#3498DB", linewidth=2.5, markersize=7)
+        for i, (_, row) in enumerate(sinav_df.iterrows()):
+            ax.annotate(f"{row['puan']:.1f}", (i, row["puan"]),
+                textcoords="offset points", xytext=(0, 10), ha="center",
+                fontsize=9, fontweight="bold", color="#2c3e50")
+        ax.set_xticks(range(len(sinav_df)))
+        ax.set_xticklabels(x_labels, fontsize=8, rotation=30, ha="right")
 
         ax.set_title("Sınav Puan Gelişimi", fontsize=14, fontweight="bold")
         ax.set_ylabel("Puan", fontsize=11)
         ax.grid(True, alpha=0.3)
-        if sinav_df["kurum_adi"].nunique() > 1:
-            ax.legend(fontsize=9)
         fig.tight_layout()
 
     def _sinav_ciz_net_line(self, fig, df):
@@ -3020,7 +3160,7 @@ class LGSTakipApp:
         prompt = f"""Sen bir LGS (Liseye Geçiş Sınavı) eğitim koçusun. Bir 8. sınıf öğrencisinin son {donem} günlük çalışma verilerini analiz edeceksin.
 
 ## LGS Hakkında Bilgiler:
-- LGS 6 dersten oluşur: Türkçe (20 soru), Matematik (20 soru), Fen Bilimleri (20 soru), Sosyal Bilgiler (10 soru), İngilizce (10 soru), Din Kültürü (10 soru)
+- LGS 6 dersten oluşur: Türkçe (20 soru), Matematik (20 soru), Fen Bilimleri (20 soru), İnkılap (10 soru), İngilizce (10 soru), Din Kültürü (10 soru)
 - Toplam 90 soru, 3 yanlış 1 doğruyu götürür (sınavda)
 - Günlük çalışmada 4 yanlış 1 doğruyu götürür (net hesaplama)
 - 500 puan üzeri çok iyi, 450+ iyi, 400+ orta, 400 altı geliştirilmeli
@@ -3616,7 +3756,7 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
 
 ## Kurallar:
 - Tam olarak JSON formatında yanıt ver, başka metin ekleme
-- Dersler: Türkçe, Matematik, Fen, Sosyal, İngilizce, Din (standartlaştır)
+- Dersler: Türkçe, Matematik, Fen, İnkılap, İngilizce, Din (standartlaştır)
 - Her ders için doğru/yanlış/boş/net bilgilerini çıkar
 - Her ders altındaki konu/kazanım analizini çıkar
 - Konu analizinde öğrencinin hangi konularda doğru/yanlış/boş yaptığını belirt
@@ -3761,8 +3901,12 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
             "matematik": "Matematik",
             "fen": "Fen",
             "fen bilimleri": "Fen",
-            "sosyal": "Sosyal",
-            "sosyal bilgiler": "Sosyal",
+            "sosyal": "İnkılap",
+            "sosyal bilgiler": "İnkılap",
+            "inkılap": "İnkılap",
+            "inkilap": "İnkılap",
+            "t.c. inkılap tarihi ve atatürkçülük": "İnkılap",
+            "inkılap tarihi": "İnkılap",
             "ingilizce": "İngilizce",
             "i̇ngilizce": "İngilizce",
             "din": "Din",

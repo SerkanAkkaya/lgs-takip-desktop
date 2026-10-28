@@ -13,7 +13,7 @@ from datetime import datetime, date, timedelta
 
 # ─── Veritabanı Sürüm Yönetimi ───
 # Her şema değişikliğinde DB_VERSION artırılır ve _migrations'a yeni fonksiyon eklenir.
-DB_VERSION = 5
+DB_VERSION = 6
 
 
 def _get_db_dir():
@@ -66,14 +66,14 @@ class _Cursor:
     pass
 
 
-DERSLER = ["Türkçe", "Matematik", "Fen", "Sosyal", "İngilizce", "Din"]
+DERSLER = ["Türkçe", "Matematik", "Fen", "İnkılap", "İngilizce", "Din"]
 
 # LGS sınav ders bilgileri (soru sayıları sabit)
 LGS_DERSLER = {
     "Türkçe":    {"soru_sayisi": 20, "katsayi": 4.0},
     "Matematik": {"soru_sayisi": 20, "katsayi": 4.0},
     "Fen":       {"soru_sayisi": 20, "katsayi": 4.0},
-    "Sosyal":    {"soru_sayisi": 10, "katsayi": 4.0},
+    "İnkılap":   {"soru_sayisi": 10, "katsayi": 4.0},
     "İngilizce": {"soru_sayisi": 10, "katsayi": 4.0},
     "Din":       {"soru_sayisi": 10, "katsayi": 4.0},
 }
@@ -82,7 +82,7 @@ DERS_RENKLERI = {
     "Türkçe": "#E74C3C",
     "Matematik": "#3498DB",
     "Fen": "#2ECC71",
-    "Sosyal": "#F39C12",
+    "İnkılap": "#F39C12",
     "İngilizce": "#9B59B6",
     "Din": "#1ABC9C",
 }
@@ -301,6 +301,8 @@ def _run_migrations(cursor, current_version):
         lambda c: None,
         # v5: SQLite ile uyumlu JSON çıktısı için zaman damgalarını metin yap.
         _migrate_v5,
+        # v6: "Sosyal" dersini "İnkılap" olarak yeniden adlandır.
+        _migrate_v6,
     ]
 
     for version_num in range(current_version, DB_VERSION):
@@ -311,6 +313,22 @@ def _run_migrations(cursor, current_version):
 def _migrate_v5(cursor):
     # Yerel SQLite'ta created_at zaten TEXT; Postgres'e özel ALTER adımları gerekmez.
     return None
+
+
+def _migrate_v6(cursor):
+    # "Sosyal" -> "İnkılap": geçmiş kayıtlar yeni ders adıyla görünür kalsın.
+    # Outbox trigger'larını (varsa) bastır; Neon tarafı ayrı script ile güncellenir.
+    try:
+        cursor.execute("UPDATE sync_control SET applying = 1 WHERE id = 1")
+        suppressed = True
+    except Exception:
+        suppressed = False
+    for table in ("soru_takip", "sinav_dersleri", "karne_ders_analizi", "karne_konu_analizi"):
+        cursor.execute(
+            f"UPDATE {table} SET ders = 'İnkılap' WHERE ders = 'Sosyal'"
+        )
+    if suppressed:
+        cursor.execute("UPDATE sync_control SET applying = 0 WHERE id = 1")
 
 
 # ═══════════════════════════════════════════════════════════
