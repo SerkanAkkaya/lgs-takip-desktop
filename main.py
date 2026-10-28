@@ -53,7 +53,7 @@ AY_ISIMLERI = {
     9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık"
 }
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_DEVELOPER = "Serkan Akkaya"
 
 # Hızlı ve güncel varsayılan Gemini modeli (thinking ağırlıklı alias'lar masaüstünde yavaş kalıyor).
@@ -3911,25 +3911,63 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         }
 
     def _karne_kayitlarini_deterministik_yenile(self):
-        """Mevcut kayıtları PDF metnindeki cevaplardan tekrar hesapla; AI özetini sayısal kaynak yapma."""
+        """Kayıtlı karne analizlerini ham PDF metninden tekrar hesapla ve güncellemeyi doğrula.
+
+        Her karne ayrı ayrı ele alınır. Tek bir eski/bozuk kayıt diğer karnelerin onarılmasını
+        engellememelidir. Ham metindeki öğrenci cevabı ve cevap anahtarı sayısal kaynaktır.
+        """
         try:
-            for karne in db.karneleri_getir(None):
+            karneler = db.karneleri_getir(None)
+        except Exception as exc:
+            print(f"Karne listesi okunamadı; deterministik yenileme yapılamadı: {exc}")
+            return
+
+        for karne in karneler:
+            try:
                 raw = karne.get("raw_text") or ""
                 parsed = self._karne_metninden_dogrulanabilir_veri(raw)
                 if not parsed["dersler"] or not parsed["konular"]:
+                    print(f"Karne #{karne.get('id')}: PDF metninden ders/konu çıkarılamadı; mevcut kayıt korunuyor.")
                     continue
+
                 mevcut = db.karne_detay_getir(karne["id"])
                 if not mevcut:
+                    print(f"Karne #{karne.get('id')}: detay kaydı bulunamadı; yenileme atlandı.")
                     continue
-                mevcut_ders = {d["ders"]: (int(d["soru_sayisi"]), int(d["dogru"]), int(d["yanlis"]), int(d["bos"])) for d in mevcut["dersler"]}
-                yeni_ders = {d["ders"]: (int(d["soru_sayisi"]), int(d["dogru"]), int(d["yanlis"]), int(d["bos"])) for d in parsed["dersler"]}
-                mevcut_konu = sorted((k["ders"], k["konu"], int(k["dogru"]), int(k["yanlis"]), int(k["bos"]), int(k["toplam"])) for k in mevcut["konular"])
-                yeni_konu = sorted((k["ders"], k["konu"], int(k["dogru"]), int(k["yanlis"]), int(k["bos"]), int(k["toplam"])) for k in parsed["konular"])
+
+                mevcut_ders = {
+                    d["ders"]: (int(d["soru_sayisi"]), int(d["dogru"]), int(d["yanlis"]), int(d["bos"]))
+                    for d in mevcut["dersler"]
+                }
+                yeni_ders = {
+                    d["ders"]: (int(d["soru_sayisi"]), int(d["dogru"]), int(d["yanlis"]), int(d["bos"]))
+                    for d in parsed["dersler"]
+                }
+                mevcut_konu = sorted(
+                    (k["ders"], k["konu"], int(k["dogru"]), int(k["yanlis"]), int(k["bos"]), int(k["toplam"]))
+                    for k in mevcut["konular"]
+                )
+                yeni_konu = sorted(
+                    (k["ders"], k["konu"], int(k["dogru"]), int(k["yanlis"]), int(k["bos"]), int(k["toplam"]))
+                    for k in parsed["konular"]
+                )
+
                 if mevcut_ders != yeni_ders or mevcut_konu != yeni_konu:
                     db.karne_analizini_yenile(karne["id"], parsed["dersler"], parsed["konular"])
-        except Exception as exc:
-            # Uygulamanın açılmasını yalnızca eski bir kayıt onarımı yüzünden engelleme.
-            print(f"Karne analiz onarımı atlandı: {exc}")
+                    # Güncelleme gerçekten veritabanına yansıdı mı? Sessiz başarısızlıkları yakala.
+                    yenilenmis = db.karne_detay_getir(karne["id"])
+                    if not yenilenmis:
+                        raise RuntimeError("Yenileme sonrası karne detayları okunamadı")
+                    kontrol_ders = {
+                        d["ders"]: (int(d["soru_sayisi"]), int(d["dogru"]), int(d["yanlis"]), int(d["bos"]))
+                        for d in yenilenmis["dersler"]
+                    }
+                    if kontrol_ders != yeni_ders:
+                        raise RuntimeError(f"Ders sonuçları yenileme sonrası uyuşmuyor: {kontrol_ders} != {yeni_ders}")
+                    print(f"Karne #{karne['id']} ({karne.get('sinav_adi') or karne.get('dosya_adi')}): sayısal analiz PDF'den yenilendi.")
+            except Exception as exc:
+                # Bir kayıttaki hata diğer sınavların düzeltilmesini durdurmasın.
+                print(f"Karne #{karne.get('id')} deterministik yenileme hatası: {exc}")
 
     def _karne_ai_analiz(self, raw_text: str, provider: str, api_key: str) -> dict:
         """PDF metnini AI ile analiz edip yapılandırılmış veri döndür."""
@@ -5027,20 +5065,9 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
 
         def islem():
             try:
-                # Tüm raw text'leri birleştir (max 12000 karakter)
-                combined = ""
-                for k in karneler:
-                    raw = k.get("raw_text", "")
-                    header = f"\n=== {k['dosya_adi']} ===\n"
-                    if len(combined) + len(header) + len(raw) < 12000:
-                        combined += header + raw + "\n"
-                    else:
-                        remaining = 12000 - len(combined) - len(header)
-                        if remaining > 200:
-                            combined += header + raw[:remaining] + "\n"
-                        break
-
-                combined = self._rag_yapilandirilmis_performans() + "\n\nHam karne metinleri:\n" + combined
+                # Ham PDF'leri sabit 12.000 karakterde kesmek eski sınavları görünmez yapıyordu.
+                # Deterministik özet, her sınavın cevaplarından yeniden hesaplanır ve tüm sınavları kapsar.
+                combined = self._rag_yapilandirilmis_performans()
                 yanit = self._rag_ai_sorgula(soru, combined, provider, api_key)
                 self.root.after(0, lambda: self._rag_sonuc_goster(yanit, len(karneler)))
             except Exception as e:
@@ -5051,21 +5078,89 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
         thread.start()
 
     def _rag_yapilandirilmis_performans(self) -> str:
-        """Tüm kayıtlı karnelerin tüm ders ve konu performansını bilgi bankası bağlamına ekle."""
-        lines = ["KAYITLI KARNELERİN YAPILANDIRILMIŞ PERFORMANSI (tüm dersler):"]
-        for karne in db.karneleri_getir(None):
-            detay = db.karne_detay_getir(karne["id"])
-            if not detay:
+        """Tüm karneleri PDF metninden yeniden hesaplayıp kompakt, eksiksiz analiz bağlamı üret.
+
+        RAG embedding'leri yalnızca ilgili metni bulmaya yardım eder. Sayısal performansın kaynağı
+        karne_ders_analizi tablosundaki eski kayıtlar değil, raw_text içindeki cevap/anahtar çiftidir.
+        Böylece hem eski kayıt hataları hem de 14.000 karakterlik kesme nedeniyle sınav kaybı önlenir.
+        """
+        karneler = db.karneleri_getir(None)
+        lines = [
+            "KAYITLI LGS KARNELERİ — PDF METNİNDEN DOĞRULANMIŞ PERFORMANS",
+            "Önemli: Sayısal sonuçlar her PDF'nin raw_text alanındaki öğrenci cevabı ile cevap anahtarı karşılaştırılarak yeniden hesaplandı.",
+            f"Toplam erişilebilir karne: {len(karneler)}",
+        ]
+        tum_konu = {}
+        tum_ders = {}
+        tum_sinavlar = []
+
+        for karne in sorted(karneler, key=lambda x: (x.get("sinav_tarihi") or "", x.get("id", 0))):
+            raw = karne.get("raw_text") or ""
+            parsed = self._karne_metninden_dogrulanabilir_veri(raw)
+            if not parsed["dersler"]:
+                lines.append(f"\nSINAV {karne.get('sinav_tarihi','')} | {karne.get('sinav_adi') or karne.get('dosya_adi','')}: PDF metninden sayısal veri çıkarılamadı; sonuç uydurulmadı.")
                 continue
-            k = detay["karne"]
-            lines.append(f"\nSINAV: {k.get('sinav_tarihi','')} | {k.get('sinav_adi') or k.get('dosya_adi','')} | {k.get('kurum_adi','')}")
-            for d in detay["dersler"]:
-                lines.append(f"DERS {d['ders']}: {d['dogru']} doğru, {d['yanlis']} yanlış, {d['bos']} boş / {d['soru_sayisi']} soru; net {d['net']:.2f}; başarı %{d['basari_yuzdesi']:.1f}.")
-            for konu in detay["konular"]:
-                toplam = max(1, konu.get("toplam", 0))
-                hata = konu.get("yanlis", 0) + konu.get("bos", 0)
-                lines.append(f"KONU {konu['ders']} — {konu['konu']}: {konu['dogru']} doğru, {konu['yanlis']} yanlış, {konu['bos']} boş / {konu['toplam']} soru; hata oranı %{hata / toplam * 100:.1f}.")
-        return "\n".join(lines)[:14000]
+
+            sinav_adi = karne.get("sinav_adi") or karne.get("dosya_adi", "İsimsiz sınav")
+            sinav_etiket = f"{sinav_adi} ({karne.get('sinav_tarihi', 'tarih yok')})"
+            tum_sinavlar.append(sinav_etiket)
+            lines.append(f"\nSINAV: {sinav_etiket} | Dosya: {karne.get('dosya_adi','')} | Kaynak soru sayısı: {len(parsed['sorular'])}")
+
+            for d in sorted(parsed["dersler"], key=lambda x: x["ders"]):
+                yuzde = d["basari_yuzdesi"]
+                lines.append(f"DERS {d['ders']}: {d['dogru']}/{d['soru_sayisi']} doğru (%{yuzde:.1f}), {d['yanlis']} yanlış, {d['bos']} boş, net {d['net']:.2f}.")
+                agg = tum_ders.setdefault(d["ders"], {"soru": 0, "dogru": 0, "yanlis": 0, "bos": 0, "sinav": 0})
+                agg["soru"] += d["soru_sayisi"]
+                agg["dogru"] += d["dogru"]
+                agg["yanlis"] += d["yanlis"]
+                agg["bos"] += d["bos"]
+                agg["sinav"] += 1
+
+            # Sınav bazında yalnızca gerçek yanlışları listele; modelin hata nedenini uydurmasını önle.
+            yanlislar = [q for q in parsed["sorular"] if q.get("durum") != "dogru"]
+            if yanlislar:
+                lines.append("YANLIŞ CEVAPLANAN SORULAR:")
+                for q in yanlislar:
+                    lines.append(f"- {q['ders']} Soru {q['soru_no']} | Kazanım: {q['konu']} | Öğrenci: {q['ogrenci_cevabi']} | Anahtar: {q['dogru_cevap']}.")
+            else:
+                lines.append("YANLIŞ CEVAPLANAN SORULAR: Yok.")
+
+            for konu in parsed["konular"]:
+                key = (konu["ders"], re.sub(r"\s+", " ", konu["konu"]).strip().casefold())
+                agg = tum_konu.setdefault(key, {
+                    "ders": konu["ders"], "konu": konu["konu"], "dogru": 0, "yanlis": 0,
+                    "bos": 0, "toplam": 0, "sinav_ids": set(), "hata_sinavlari": set()
+                })
+                agg["dogru"] += konu["dogru"]
+                agg["yanlis"] += konu["yanlis"]
+                agg["bos"] += konu["bos"]
+                agg["toplam"] += konu["toplam"]
+                agg["sinav_ids"].add(sinav_etiket)
+                if konu["yanlis"] or konu["bos"]:
+                    agg["hata_sinavlari"].add(sinav_etiket)
+
+        lines.append("\n===== TÜM SINAVLAR BİRLİKTE: DERS BAZLI TOPLAM =====")
+        for ders, a in sorted(tum_ders.items()):
+            yuzde = 100.0 * a["dogru"] / max(1, a["soru"])
+            lines.append(f"{ders}: {a['dogru']}/{a['soru']} doğru (%{yuzde:.1f}); {a['yanlis']} yanlış, {a['bos']} boş; {a['sinav']} sınav-kayıt toplamı.")
+
+        lines.append("\n===== TÜM SINAVLAR BİRLİKTE: KONU BAZLI TEKRAR İHTİYACI =====")
+        konu_sirali = sorted(
+            tum_konu.values(),
+            key=lambda a: (a["yanlis"] + a["bos"], (a["yanlis"] + a["bos"]) / max(1, a["toplam"]), a["toplam"]),
+            reverse=True,
+        )
+        for a in konu_sirali:
+            hata = a["yanlis"] + a["bos"]
+            if hata == 0:
+                continue
+            oran = 100.0 * hata / max(1, a["toplam"])
+            lines.append(
+                f"{a['ders']} — {a['konu']}: {a['dogru']} doğru, {a['yanlis']} yanlış, {a['bos']} boş / {a['toplam']} soru; hata %{oran:.1f}; hata görülen sınav sayısı {len(a['hata_sinavlari'])}/{len(a['sinav_ids'])} konu örneklemi."
+            )
+
+        lines.append("\nYORUMLAMA KURALLARI: Tek soruluk bir kazanım kesin konu eksikliği sayılmaz. Aynı kazanım farklı sınavlarda tekrarlayan yanlış içeriyorsa önceliği yükselt. Yanlışın nedeni yalnızca cevap harflerinden kesin çıkarılamaz; konu/beceri düzeyinde öneri ver, öğrencinin düşünme hatasını uydurma. Her sınavın soru dağılımı farklı olabileceğinden konu oranlarını örneklem sayısıyla birlikte yorumla.")
+        return "\n".join(lines)
 
     def _rag_ai_sorgula(self, soru: str, context: str, provider: str, api_key: str) -> str:
         """RAG sorgusu: context + soru → AI yanıt."""
@@ -5073,7 +5168,7 @@ Sadece öğrencinin ZAYIF NOKTALARINA odaklan:
 Bu bilgileri kullanarak soruyu detaylı ve Türkçe olarak yanıtla.
 
 ## Karne Bilgileri:
-{context[:18000]}
+{context[:32000]}
 
 ## Soru:
 {soru}
@@ -5081,9 +5176,12 @@ Bu bilgileri kullanarak soruyu detaylı ve Türkçe olarak yanıtla.
 ## Kurallar:
 - Sadece verilen karne bilgilerine dayanarak yanıt ver; kayıtlı yapılandırılmış performans satırlarını mutlaka kullan.
 - Soru belirli bir dersle sınırlı değilse Türkçe, Matematik, Fen, Sosyal/İnkılap, İngilizce ve Din derslerinin tümünü değerlendir.
-- Tek karne ile tüm karnelerin kümülatif sonuçlarını birbirine karıştırma; sınav ve örneklem sayısını belirt.
+- Tüm sınavları kapsayan "TÜM SINAVLAR BİRLİKTE" bölümünü kullan; yalnızca en yeni iki sınavla yetinme.
+- Tek karne sonuçları ile kümülatif sonuçları ayır; sınav sayısını ve soru örneklemini belirt.
 - Yüzdeyi doğru / (doğru + yanlış + boş) olarak hesapla; veri eksikse açıkça belirt ve tahmin etme.
-- Somut veriler ve yüzdeler kullan
+- Konu önceliğini yalnızca tek bir sınavdaki düşük yüzdeye göre belirleme; tekrar eden hatalara ve soru sayısına bak.
+- Yanlış cevabın harfinden öğrencinin neden yanıldığını kesinmiş gibi çıkarma.
+- Somut veriler ve yüzdeler kullan.
 - Emoji kullanarak okunabilirliği artır
 - LGS perspektifinden değerlendir
 - Öneriler sun
