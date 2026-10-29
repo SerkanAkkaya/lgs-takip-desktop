@@ -53,7 +53,7 @@ AY_ISIMLERI = {
     9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık"
 }
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.3"
 APP_DEVELOPER = "Serkan Akkaya"
 
 # Hızlı ve güncel varsayılan Gemini modeli (thinking ağırlıklı alias'lar masaüstünde yavaş kalıyor).
@@ -93,9 +93,15 @@ class LGSTakipApp:
         )
         self.root.place_window_center()
 
-        # Türkçe karakter giriş/görüntüleme sorununu önlemek için Tk'yi UTF-8'e sabitle.
+        # Tkinter, Python 3'te metinleri Unicode olarak işler. Tcl sistem
+        # kodlamasını zorla değiştirmek bazı Windows kurulumlarında Türkçe
+        # karakter girişini bozabildiğinden varsayılan kodlamaya dokunmuyoruz.
+        # Uygulama genelinde Türkçe karakterleri destekleyen fontları kullan.
         try:
-            self.root.tk.call("encoding", "system", "utf-8")
+            import tkinter.font as tkfont
+            for font_name in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
+                tkfont.nametofont(font_name).configure(family="Segoe UI")
+            self.root.option_add("*Font", ("Segoe UI", 10))
         except Exception:
             pass
 
@@ -1976,8 +1982,15 @@ class LGSTakipApp:
         ttkb.Label(form_inner, text="📋 Sınav Adı:", font=("Segoe UI", 10)).grid(
             row=row, column=0, sticky=W, pady=4, padx=5)
         self.sinav_adi_var = tk.StringVar()
-        ttkb.Entry(form_inner, textvariable=self.sinav_adi_var, font=("Segoe UI", 10), width=30).grid(
+        self.sinav_adi_entry = ttkb.Entry(
+            form_inner, textvariable=self.sinav_adi_var, font=("Segoe UI", 10), width=30)
+        self.sinav_adi_entry.grid(
             row=row, column=1, columnspan=2, sticky=EW, pady=4, padx=5)
+        # Bazı Windows/Tcl paketlerinde Türkçe Windows-1254 karakterleri yanlış
+        # Unicode karakterleri olarak alana düşebiliyor (ı->ý, ş->þ, ğ->ð).
+        # Giriş ve yapıştırma sonrası yalnızca bilinen bozuk kodlama dizilerini düzelt.
+        self._sinav_adi_duzeltme_devam = False
+        self.sinav_adi_var.trace_add("write", self._sinav_adi_turkce_karakterleri_duzelt)
 
         row += 1
         # Sınav tarihi
@@ -2012,9 +2025,9 @@ class LGSTakipApp:
         puan_entry = ttkb.Entry(
             form_inner, textvariable=self.sinav_puan_var, font=("Segoe UI", 10), width=12)
         puan_entry.grid(row=row, column=1, sticky=W, pady=4, padx=5)
-        puan_entry.bind("<KeyRelease>", self._sinav_puan_elle_girildi)
+        self.sinav_puan_var.trace_add("write", self._sinav_puan_elle_girildi)
         ttkb.Label(
-            form_inner, text="Netlerden tahmini hesaplanır; elle değiştirebilirsiniz.",
+            form_inner, text="Tahmini puan otomatik hesaplanır; elle değiştirirseniz değeriniz korunur.",
             font=("Segoe UI", 8), bootstyle="secondary").grid(
                 row=row, column=2, sticky=W, pady=4, padx=3)
 
@@ -2077,17 +2090,20 @@ class LGSTakipApp:
             self.sinav_ders_vars[ders] = {"ss": ss_var, "d": d_var, "y": y_var, "net_lbl": net_lbl}
 
             # LGS net hesaplama (3 yanlış 1 doğruyu götürür)
-            def _calc_net(ders_key=ders, *args):
+            def _calc_net(*args, ders_key=ders):
                 try:
                     v = self.sinav_ders_vars[ders_key]
                     d = max(0, int(v["d"].get() or 0))
                     y = max(0, int(v["y"].get() or 0))
                     ss = max(0, int(v["ss"].get() or 0))
-                    net = max(0.0, min(float(ss), d - (y / 3.0)))
+                    # 2026 LGS ham puanı: doğru - yanlış / 3.
+                    # Resmî formülde ham puan sıfıra sabitlenmez.
+                    net = d - (y / 3.0)
                     v["net_lbl"].configure(text=f"{net:.2f}")
                 except ValueError:
                     pass
 
+            ss_var.trace_add("write", _calc_net)
             d_var.trace_add("write", _calc_net)
             y_var.trace_add("write", _calc_net)
 
@@ -2114,18 +2130,24 @@ class LGSTakipApp:
                     d = max(0, int(v["d"].get() or 0))
                     y = max(0, int(v["y"].get() or 0))
                     ss = max(0, int(v["ss"].get() or 0))
-                    net = max(0.0, min(float(ss), d - (y / 3.0)))
+                    # MEB 2026: her testin ham puanı doğru - yanlış / 3.
+                    net = d - (y / 3.0)
                     toplam += net
                     agirlikli_net += net * agirliklar.get(ders, 1)
                 except ValueError:
                     pass
             self.sinav_toplam_net_lbl.configure(text=f"{toplam:.2f}")
+            # Uygulama içi yaklaşık LGS puanı: ağırlıklı neti 270 üzerinden
+            # 100-500 aralığına ölçekler. Bu değer MEB'in ülke geneli istatistiklerle
+            # hesaplanan resmî puanı değil, denemeleri karşılaştırmaya yarayan tahmindir.
+            # Kullanıcı puan alanına dokunursa kendi değeri korunur.
             if not getattr(self, "_sinav_puan_elle_degisti", False):
-                # Bu yaklaşık bir göstergedir; resmî LGS puanı değildir.
                 tahmini_puan = max(100.0, min(500.0, 100.0 + (agirlikli_net / 270.0) * 400.0))
                 self._sinav_puan_programatik = True
-                self.sinav_puan_var.set(f"{tahmini_puan:.2f}")
-                self._sinav_puan_programatik = False
+                try:
+                    self.sinav_puan_var.set(f"{tahmini_puan:.2f}")
+                finally:
+                    self._sinav_puan_programatik = False
 
         for ders in DERSLER:
             self.sinav_ders_vars[ders]["d"].trace_add("write", _calc_toplam)
@@ -2407,8 +2429,34 @@ class LGSTakipApp:
         ttkb.Button(dlg, text="Kaydet", command=_kaydet, bootstyle="success").pack(pady=5)
 
     # ── Sınav CRUD ──
-    def _sinav_puan_elle_girildi(self, event=None):
-        """Kullanıcı puanı elle yazarsa otomatik güncellemeyi durdur."""
+    def _sinav_adi_turkce_karakterleri_duzelt(self, *args):
+        """Sınav adı alanına yanlış kodlama ile düşen Türkçe karakterleri düzelt."""
+        if getattr(self, "_sinav_adi_duzeltme_devam", False):
+            return
+        mevcut = self.sinav_adi_var.get()
+        ceviriler = {
+            "ý": "ı", "Ý": "İ", "þ": "ş", "Þ": "Ş", "ð": "ğ", "Ð": "Ğ",
+            "Ä±": "ı", "Ä°": "İ", "ÅŸ": "ş", "Åž": "Ş", "ÄŸ": "ğ", "Äž": "Ğ",
+            "Ã§": "ç", "Ã‡": "Ç", "Ã¼": "ü", "Ãœ": "Ü", "Ã¶": "ö", "Ã–": "Ö",
+        }
+        duzeltilmis = mevcut
+        for bozuk, dogru in ceviriler.items():
+            duzeltilmis = duzeltilmis.replace(bozuk, dogru)
+        if duzeltilmis == mevcut:
+            return
+        try:
+            imlec = self.sinav_adi_entry.index(tk.INSERT)
+        except Exception:
+            imlec = len(mevcut)
+        self._sinav_adi_duzeltme_devam = True
+        try:
+            self.sinav_adi_var.set(duzeltilmis)
+            self.sinav_adi_entry.icursor(max(0, imlec))
+        finally:
+            self._sinav_adi_duzeltme_devam = False
+
+    def _sinav_puan_elle_girildi(self, *args):
+        """Puan alanındaki kullanıcı değişikliklerini (yazma/yapıştırma) izle."""
         if not getattr(self, "_sinav_puan_programatik", False):
             self._sinav_puan_elle_degisti = True
 
@@ -2497,7 +2545,10 @@ class LGSTakipApp:
         self.sinav_adi_var.set("")
         self.sinav_tarihi_var.set(date.today().strftime("%d/%m/%Y"))
         self.sinav_kurum_var.set("(Seçiniz)")
+        self._sinav_puan_programatik = True
         self.sinav_puan_var.set("")
+        self._sinav_puan_programatik = False
+        self._sinav_puan_elle_degisti = False
         for var in self.derece_vars.values():
             var.set("")
         lgs_soru = {"Türkçe": 20, "Matematik": 20, "Fen": 20, "İnkılap": 10, "İngilizce": 10, "Din": 10}
@@ -2669,8 +2720,13 @@ class LGSTakipApp:
         else:
             self.sinav_kurum_var.set("(Seçiniz)")
 
-        # Puan
-        self.sinav_puan_var.set(str(s["puan"]) if s["puan"] else "")
+        # Puan: kayıtlı değer yüklenirken kullanıcı elle değiştirmiş sayılmaz.
+        self._sinav_puan_programatik = True
+        try:
+            self.sinav_puan_var.set(str(s["puan"]) if s["puan"] else "")
+        finally:
+            self._sinav_puan_programatik = False
+        self._sinav_puan_elle_degisti = bool(s.get("puan"))
 
         # Dereceler
         derece_map = {
